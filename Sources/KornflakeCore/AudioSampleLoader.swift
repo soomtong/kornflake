@@ -57,7 +57,7 @@ public final class AudioSampleLoader: @unchecked Sendable {
 
         // Read only the part of the sample that can actually be heard. This matters
         // for monolith samples that can be several minutes long.
-        var start = min(max(0, startFrame), totalFrames - 1)
+        let start = min(max(0, startFrame), totalFrames - 1)
         var end: Int
         if endFrame > 0 {
             end = min(endFrame, totalFrames)

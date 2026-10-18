@@ -5,24 +5,32 @@ import AVFoundation
 import KornflakeCore
 
 final class AppModel: ObservableObject {
-    static let defaultRoot = URL(fileURLWithPath: "/Volumes/Ultra Touch/Pile/+Kontakt", isDirectory: true)
+    private static let folderDefaultsKey = "instrumentFolderPath"
 
-    @Published var rootURL: URL = AppModel.defaultRoot
-    @Published private(set) var libraries: [LibraryRef] = []
+    /// The single Kontakt instrument folder (for example "Yamaha Motif ES").
+    /// Its sub-folders are patch categories and the .nki files inside are patches.
+    @Published private(set) var rootURL: URL?
+    @Published private(set) var categories: [LibraryRef] = []
     @Published private(set) var instrumentByID: [String: InstrumentRef] = [:]
 
-    @Published var selectedLibraryID: String?
     @Published var selectedInstrumentID: String?
     @Published var searchText = ""
-    @Published var drmFreeOnly = true
+    @Published var isSearchFocused = false
+    @Published private(set) var searchFocusRequest = 0
 
     @Published private(set) var isScanning = false
-    @Published private(set) var scanMessage = ""
+    @Published private var scanStatus: ScanStatus = .idle
     @Published private(set) var scanFraction = 0.0
 
     @Published private(set) var parsedInstrument: ParsedInstrument?
     @Published private(set) var isParsing = false
-    @Published private(set) var parseMessage: String?
+    @Published private var parseIssue: ParseIssue?
+    @Published var language: AppLanguage = {
+        UserDefaults.standard.string(forKey: "language").flatMap(AppLanguage.init(rawValue:))
+            ?? AppLanguage.systemDefault
+    }() {
+        didSet { UserDefaults.standard.set(language.rawValue, forKey: "language") }
+    }
     @Published var selectedGroupIndex: Int?
 
     @Published var mode: AuditionMode = .scale
@@ -33,62 +41,288 @@ final class AppModel: ObservableObject {
     @Published var sequential = true
     @Published var descending = false
     @Published var twoOctaves = false
+    /// Scale goes up and back down (or down and back up with descending) in one pass.
+    @Published var upDown = false
+    @Published var extendUp = 0
+    @Published var extendDown = 0
     @Published var loop = false
     @Published var noteLength: NoteLength = .quarter
     @Published var tempo: Double = 120
     @Published var pedalHold = false
+    /// Restart playback when a control changes while playing, so the new setting is heard at once.
+    @Published var autoPlayback = true
+
+    @Published var midiEnabled = AppModel.stored("midiEnabled", false) {
+        didSet { UserDefaults.standard.set(midiEnabled, forKey: "midiEnabled") }
+    }
+    /// 1...16 as shown to the user.
+    @Published var midiChannel = AppModel.stored("midiChannel", 1) {
+        didSet { UserDefaults.standard.set(midiChannel, forKey: "midiChannel") }
+    }
+    /// nil is the "Kornflake" virtual port; otherwise the unique ID of a MIDI destination.
+    @Published var midiDestinationID: Int32? = {
+        (UserDefaults.standard.object(forKey: "midiDestinationID") as? Int).map { Int32(truncatingIfNeeded: $0) }
+    }() {
+        didSet { UserDefaults.standard.set(midiDestinationID.map { Int($0) }, forKey: "midiDestinationID") }
+    }
+    /// Keeps the built-in sample sound on so it plays together with MIDI out.
+    @Published var internalSound = AppModel.stored("internalSound", true) {
+        didSet { UserDefaults.standard.set(internalSound, forKey: "internalSound") }
+    }
+    @Published private(set) var midiDestinations: [MIDIDestinationInfo] = []
 
     @Published private(set) var isPlaying = false
     @Published private(set) var currentNoteNames: [String] = []
     @Published private(set) var playbackMessage = ""
 
+    private enum ScanStatus {
+        case idle
+        case scanning
+        case progress(library: String, patches: Int)
+        case done(name: String, categories: Int, patches: Int)
+        case failed(String)
+    }
+
+    private enum ParseIssue {
+        case protected
+        case k42
+        case unknown
+        case failed(String)
+    }
+
+    private let midi = MIDIOutput()
+    private var keyMonitor: Any?
+    private var autoPlaybackCancellable: AnyCancellable?
+    private var playWhenParsed = false
+    private var isTestTone = false
     private let player = PreviewPlayer()
     private let playbackQueue = DispatchQueue(label: "kornflake.preview", qos: .userInitiated)
     private let stateLock = NSLock()
     private var playbackGeneration: UInt64 = 0
     private var parseGeneration: UInt64 = 0
 
+    private static func stored<T>(_ key: String, _ fallback: T) -> T {
+        UserDefaults.standard.object(forKey: key) as? T ?? fallback
+    }
+
+    init() {
+        refreshMIDIDestinations()
+        midi.onSetupChanged = { [weak self] in
+            DispatchQueue.main.async { self?.refreshMIDIDestinations() }
+        }
+
+        // @Published fires before the value changes; the debounce lets it settle before restarting.
+        let changes: [AnyPublisher<Void, Never>] = [
+            $mode.map { _ in }.eraseToAnyPublisher(),
+            $rootPitchClass.map { _ in }.eraseToAnyPublisher(),
+            $octave.map { _ in }.eraseToAnyPublisher(),
+            $scale.map { _ in }.eraseToAnyPublisher(),
+            $chord.map { _ in }.eraseToAnyPublisher(),
+            $sequential.map { _ in }.eraseToAnyPublisher(),
+            $descending.map { _ in }.eraseToAnyPublisher(),
+            $twoOctaves.map { _ in }.eraseToAnyPublisher(),
+            $upDown.map { _ in }.eraseToAnyPublisher(),
+            $extendUp.map { _ in }.eraseToAnyPublisher(),
+            $extendDown.map { _ in }.eraseToAnyPublisher(),
+            $noteLength.map { _ in }.eraseToAnyPublisher(),
+            $tempo.map { _ in }.eraseToAnyPublisher(),
+            $pedalHold.map { _ in }.eraseToAnyPublisher(),
+            $loop.map { _ in }.eraseToAnyPublisher(),
+            $selectedGroupIndex.map { _ in }.eraseToAnyPublisher(),
+            $midiEnabled.map { _ in }.eraseToAnyPublisher(),
+            $midiChannel.map { _ in }.eraseToAnyPublisher(),
+            $midiDestinationID.map { _ in }.eraseToAnyPublisher(),
+            $internalSound.map { _ in }.eraseToAnyPublisher()
+        ]
+        autoPlaybackCancellable = Publishers.MergeMany(changes)
+            .dropFirst(changes.count)
+            .debounce(for: .milliseconds(150), scheduler: RunLoop.main)
+            .sink { [weak self] in
+                guard let self, self.autoPlayback, self.isPlaying, !self.isTestTone else { return }
+                self.play()
+            }
+    }
+
     var selectedInstrument: InstrumentRef? {
         guard let selectedInstrumentID else { return nil }
         return instrumentByID[selectedInstrumentID]
     }
 
-    var selectedLibrary: LibraryRef? {
-        libraries.first { $0.id == selectedLibraryID }
+    var scanMessage: String {
+        switch scanStatus {
+        case .idle:
+            return ""
+        case .scanning:
+            return tr("Scanning patches…", "패치를 검색하는 중…")
+        case .progress(let library, let patches):
+            return tr("\(library) · \(patches) patches", "\(library) · 패치 \(patches)개")
+        case .done(let name, let categories, let patches):
+            return tr(
+                "\(name) · \(categories) categories · \(patches) patches",
+                "\(name) · 카테고리 \(categories)개 · 패치 \(patches)개"
+            )
+        case .failed(let message):
+            return tr("Scan failed: \(message)", "검색 실패: \(message)")
+        }
     }
 
-    var visibleLibraries: [LibraryRef] {
-        if drmFreeOnly {
-            return libraries.filter { $0.playableCount > 0 }
+    var parseMessage: String? {
+        switch parseIssue {
+        case nil:
+            return nil
+        case .protected:
+            return tr(
+                "This is a Kontakt 5+ encrypted container. Kornflake does not decrypt protected instruments. To audition this one, load it in Kontakt.",
+                "Kontakt 5+ 암호화 컨테이너입니다. Kornflake는 보호된 악기를 복호화하지 않습니다. 이 악기는 Kontakt에서 불러와 들어 보세요."
+            )
+        case .k42:
+            return tr(
+                "Kontakt 4.2 instruments use a different compressed mapping that is not supported yet.",
+                "Kontakt 4.2 악기는 다른 압축 매핑을 사용하며 아직 지원하지 않습니다."
+            )
+        case .unknown:
+            return tr("Unrecognized Kontakt file format.", "인식할 수 없는 Kontakt 파일 형식입니다.")
+        case .failed(let message):
+            return message
         }
-        return libraries
     }
 
-    var totalVisibleInstrumentCount: Int {
-        if drmFreeOnly {
-            return instrumentByID.values.lazy.filter { $0.isPlayable }.count
-        }
-        return instrumentByID.count
+    var instrumentName: String {
+        rootURL?.lastPathComponent ?? "Yamaha Motif Player"
     }
 
-    var visibleInstruments: [InstrumentRef] {
-        var result: [InstrumentRef]
-        if let selectedLibrary = selectedLibrary {
-            result = selectedLibrary.instruments
-        } else {
-            result = libraries.flatMap(\.instruments)
-        }
-        if drmFreeOnly {
-            result = result.filter { $0.isPlayable }
-        }
+    var patchCount: Int {
+        instrumentByID.values.lazy.filter { $0.isPlayable }.count
+    }
+
+    /// Patch categories filtered by the search text. Categories without a match are dropped.
+    var visibleCategories: [LibraryRef] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !query.isEmpty {
-            result = result.filter { instrument in
-                instrument.name.localizedCaseInsensitiveContains(query)
-                    || instrument.library.localizedCaseInsensitiveContains(query)
+        return categories.compactMap { category in
+            var patches = category.instruments.filter { $0.isPlayable }
+            if !query.isEmpty && !CategoryStyle(folderName: category.name).matches(query) {
+                patches = patches.filter { $0.name.localizedCaseInsensitiveContains(query) }
             }
+            guard !patches.isEmpty else { return nil }
+            var filtered = category
+            filtered.instruments = patches
+            return filtered
         }
-        return result
+    }
+
+    // MARK: Keyboard navigation
+
+    func requestSearchFocus() {
+        searchFocusRequest &+= 1
+    }
+
+    /// Moves the patch selection through the visible (filtered) list without wrapping.
+    func selectAdjacentPatch(_ delta: Int) {
+        let ids = visibleCategories.flatMap { $0.instruments.map(\.id) }
+        guard !ids.isEmpty else { return }
+        guard let current = selectedInstrumentID.flatMap({ ids.firstIndex(of: $0) }) else {
+            selectedInstrumentID = delta > 0 ? ids.first : ids.last
+            return
+        }
+        selectedInstrumentID = ids[min(ids.count - 1, max(0, current + delta))]
+    }
+
+    func selectFirstVisiblePatch() {
+        selectedInstrumentID = visibleCategories.first?.instruments.first?.id
+    }
+
+    /// Jumps to the first patch of the next or previous category.
+    func selectAdjacentCategory(_ delta: Int) {
+        let visible = visibleCategories
+        guard !visible.isEmpty else { return }
+        let current = visible.firstIndex { category in
+            category.instruments.contains { $0.id == selectedInstrumentID }
+        }
+        let target = current.map { min(visible.count - 1, max(0, $0 + delta)) } ?? (delta > 0 ? 0 : visible.count - 1)
+        selectedInstrumentID = visible[target].instruments.first?.id
+    }
+
+    /// Kontakt group names in these patches are leftovers such as "slice #1 (from: SoTrue) #2",
+    /// so a layer is described by what it actually covers instead.
+    func layerLabel(_ group: K2Group, position: Int) -> String {
+        let zones = parsedInstrument?.zones.filter { $0.groupIndex == group.index } ?? []
+        var parts = [tr("Layer \(position)", "레이어 \(position)")]
+        if let low = zones.map(\.lowVelocity).min(), let high = zones.map(\.highVelocity).max() {
+            parts.append(low <= 1 && high >= 127
+                ? tr("all velocities", "전체 벨로시티")
+                : tr("velocity \(low)–\(high)", "벨로시티 \(low)–\(high)"))
+        }
+        if let low = zones.map(\.lowKey).min(), let high = zones.map(\.highKey).max() {
+            parts.append("\(NoteNaming.name(midi: low))–\(NoteNaming.name(midi: high))")
+        }
+        parts.append(tr("\(zones.count) zones", "존 \(zones.count)개"))
+        return parts.joined(separator: " · ")
+    }
+
+    func cycleLayer(_ delta: Int) {
+        let options: [Int?] = [nil] + availableGroups.map { Optional($0.index) }
+        let current = options.firstIndex { $0 == selectedGroupIndex } ?? 0
+        selectedGroupIndex = options[(current + delta + options.count) % options.count]
+    }
+
+    func cycleScaleOrChord(_ delta: Int) {
+        if mode == .scale {
+            scale = Self.cycled(ScaleType.all, from: scale, by: delta)
+        } else {
+            chord = Self.cycled(ChordType.all, from: chord, by: delta)
+        }
+    }
+
+    func refreshMIDIDestinations() {
+        midiDestinations = midi.destinations()
+        // A remembered port that has been unplugged falls back to the virtual port.
+        if let id = midiDestinationID, !midiDestinations.contains(where: { $0.id == id }) {
+            midiDestinationID = nil
+        }
+    }
+
+    /// The MIDI target for a new playback, or nil while MIDI out is off.
+    private var activeMIDITarget: MIDITarget? {
+        midiEnabled ? MIDITarget(channel: midiChannel - 1, destinationID: midiDestinationID) : nil
+    }
+
+    func adjustExtendUp(_ delta: Int) {
+        extendUp = min(Self.maxExtension, max(0, extendUp + delta))
+    }
+
+    func adjustExtendDown(_ delta: Int) {
+        extendDown = min(Self.maxExtension, max(0, extendDown + delta))
+    }
+
+    static let maxExtension = 6
+
+    func shiftRoot(_ delta: Int) {
+        rootPitchClass = ((rootPitchClass + delta) % 12 + 12) % 12
+    }
+
+    func shiftOctave(_ delta: Int) {
+        octave = min(6, max(1, octave + delta))
+    }
+
+    func cycleNoteLength(_ delta: Int) {
+        let all = NoteLength.allCases
+        let current = all.firstIndex(of: noteLength) ?? 0
+        noteLength = all[min(all.count - 1, max(0, current + delta))]
+    }
+
+    func adjustTempo(_ delta: Double) {
+        tempo = min(240, max(40, tempo + delta))
+    }
+
+    private static func cycled<T: Equatable>(_ all: [T], from value: T, by delta: Int) -> T {
+        let current = all.firstIndex(of: value) ?? 0
+        return all[(current + delta + all.count) % all.count]
+    }
+
+    /// Sample lookup is scoped to the loaded instrument folder.
+    private var resolverLocation: (root: URL, library: String) {
+        guard let rootURL else { return (URL(fileURLWithPath: "/"), "") }
+        return (rootURL.deletingLastPathComponent(), rootURL.lastPathComponent)
     }
 
     var noteDuration: TimeInterval {
@@ -103,7 +337,11 @@ final class AppModel: ObservableObject {
             scale: scale,
             chord: chord,
             descending: descending,
-            twoOctaves: twoOctaves
+            twoOctaves: twoOctaves,
+            extendUp: extendUp,
+            extendDown: extendDown,
+            upDown: upDown,
+            seamless: loop
         )
     }
 
@@ -113,11 +351,14 @@ final class AppModel: ObservableObject {
         return parsedInstrument.groups.filter { groupIndices.contains($0.index) && !$0.isReleaseTrigger && !$0.isMuted }
     }
 
+    /// Loads the folder remembered from the last session, or asks for one.
     func bootstrap() {
-        if !FileManager.default.fileExists(atPath: rootURL.path) {
-            rootURL = FileManager.default.homeDirectoryForCurrentUser
+        if let path = UserDefaults.standard.string(forKey: Self.folderDefaultsKey),
+           FileManager.default.fileExists(atPath: path) {
+            load(folder: URL(fileURLWithPath: path, isDirectory: true))
+        } else {
+            chooseRoot()
         }
-        scan()
     }
 
     func chooseRoot() {
@@ -125,71 +366,78 @@ final class AppModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose Kontakt Folder"
-        panel.directoryURL = rootURL
+        panel.message = tr(
+            "Choose the Kontakt instrument folder (for example Yamaha Motif ES)",
+            "Kontakt 악기 폴더를 선택하세요 (예: Yamaha Motif ES)"
+        )
+        panel.prompt = tr("Load Instrument", "악기 불러오기")
+        panel.directoryURL = rootURL?.deletingLastPathComponent()
         if panel.runModal() == .OK, let url = panel.url {
-            stop()
-            rootURL = url
-            selectedLibraryID = nil
-            selectedInstrumentID = nil
-            parsedInstrument = nil
-            scan()
+            UserDefaults.standard.set(url.path, forKey: Self.folderDefaultsKey)
+            load(folder: url)
         }
     }
 
+    private func load(folder: URL) {
+        stop()
+        rootURL = folder
+        selectedInstrumentID = nil
+        parsedInstrument = nil
+        scan()
+    }
+
     func scan() {
-        guard !isScanning else { return }
+        guard !isScanning, let root = rootURL else { return }
         isScanning = true
-        scanMessage = "Scanning instrument files…"
+        scanStatus = .scanning
         scanFraction = 0
-        libraries = []
+        categories = []
         instrumentByID = [:]
         selectedInstrumentID = nil
         parsedInstrument = nil
 
-        let root = rootURL
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let result = try KontaktScanner.scan(rootURL: root) { progress in
                     DispatchQueue.main.async {
                         guard let self else { return }
-                        self.scanMessage = "\(progress.library) · \(progress.instruments) instruments"
+                        self.scanStatus = .progress(library: progress.library, patches: progress.instruments)
                         self.scanFraction = progress.fraction
                     }
                 }
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.libraries = result
+                    self.categories = result
                     var index: [String: InstrumentRef] = [:]
-                    for library in result {
-                        for instrument in library.instruments {
+                    for category in result {
+                        for instrument in category.instruments {
                             index[instrument.id] = instrument
                         }
                     }
                     self.instrumentByID = index
                     self.isScanning = false
                     self.scanFraction = 1
-                    self.scanMessage = "\(result.count) libraries · \(index.count) instruments"
-                    if self.selectedLibraryID == nil {
-                        self.selectedLibraryID = self.visibleLibraries.first(where: { $0.playableCount > 0 })?.id
-                    }
+                    self.scanStatus = .done(name: root.lastPathComponent, categories: result.count, patches: index.count)
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.isScanning = false
-                    self.scanMessage = "Scan failed: \(error.localizedDescription)"
+                    self.scanStatus = .failed(error.localizedDescription)
                 }
             }
         }
     }
 
     func selectInstrument(_ id: String?) {
+        let keepPlaying = autoPlayback && isPlaying && !isTestTone
         parsedInstrument = nil
-        parseMessage = nil
+        parseIssue = nil
         selectedGroupIndex = nil
+        playWhenParsed = false
         stop()
         guard let id, let instrument = instrumentByID[id] else { return }
+        playWhenParsed = keepPlaying
         parse(instrument: instrument)
     }
 
@@ -201,17 +449,16 @@ final class AppModel: ObservableObject {
 
         guard instrument.format == .k2 else {
             if instrument.format == .k5 || instrument.format == .k5Monolith {
-                parseMessage = "This is a Kontakt 5+ encrypted container. Kornflake does not decrypt protected instruments. To audition this one, load it in Kontakt."
+                parseIssue = .protected
             } else if instrument.format == .k42 {
-                parseMessage = "Kontakt 4.2 instruments use a different compressed mapping that is not supported yet."
+                parseIssue = .k42
             } else {
-                parseMessage = "Unrecognized Kontakt file format."
+                parseIssue = .unknown
             }
             return
         }
 
         isParsing = true
-        parseMessage = "Reading instrument mapping…"
         let url = instrument.url
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -225,11 +472,12 @@ final class AppModel: ObservableObject {
                     guard current == generation else { return }
                     self.parsedInstrument = parsed
                     self.isParsing = false
-                    self.parseMessage = nil
+                    self.parseIssue = nil
                     self.selectedGroupIndex = nil
-                    self.playbackMessage = parsed.isMonolith
-                        ? "\(parsed.zones.count) zones · \(parsed.groups.count) groups · embedded samples"
-                        : "\(parsed.zones.count) zones · \(parsed.groups.count) groups"
+                    if self.playWhenParsed {
+                        self.playWhenParsed = false
+                        self.play()
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -239,41 +487,51 @@ final class AppModel: ObservableObject {
                     self.stateLock.unlock()
                     guard current == generation else { return }
                     self.isParsing = false
-                    self.parseMessage = error.localizedDescription
+                    self.parseIssue = .failed(error.localizedDescription)
                 }
             }
         }
     }
 
     func play() {
+        if isParsing {
+            // Space right after picking a patch: start as soon as the mapping is ready.
+            playWhenParsed = true
+            return
+        }
         guard let parsed = parsedInstrument, parsed.format == .k2 else { return }
         stop()
 
         do {
             try player.prepare()
         } catch {
-            playbackMessage = "Audio engine could not start: \(error.localizedDescription)"
+            playbackMessage = tr(
+                "Audio engine could not start: \(error.localizedDescription)",
+                "오디오 엔진을 시작할 수 없습니다: \(error.localizedDescription)"
+            )
             return
         }
 
         let plan = plannedPlan
         guard !plan.midiNotes.isEmpty else { return }
         let groupIndex = selectedGroupIndex
-        let root = rootURL
-        let library = selectedInstrument?.library ?? ""
+        let (root, library) = resolverLocation
         let length = noteDuration
         let shouldLoop = loop
         let together = !sequential
         let hold = pedalHold
+        let target = activeMIDITarget
+        let useInternal = internalSound || target == nil
 
         stateLock.lock()
         playbackGeneration &+= 1
         let generation = playbackGeneration
         stateLock.unlock()
 
+        if hold, let target { midi.sustain(true, target: target) }
         isPlaying = true
         currentNoteNames = []
-        playbackMessage = "Preparing samples…"
+        playbackMessage = tr("Preparing samples…", "샘플을 준비하는 중…")
 
         playbackQueue.async { [weak self] in
             guard let self else { return }
@@ -287,16 +545,56 @@ final class AppModel: ObservableObject {
                 loop: shouldLoop,
                 together: together,
                 hold: hold,
+                midiTarget: target,
+                useInternal: useInternal,
                 generation: generation
             )
         }
     }
 
+    /// Key handling that menu key equivalents cannot cover.
+    /// - Space: a focused list, button or picker consumes a bare space before the menu sees
+    ///   it. Text input still receives the key, so searching for "Full Grand" keeps working.
+    /// - Arrow keys: ⌘ and ⌥⌘ with an arrow mirror the H/J/K/L menu shortcuts, so both
+    ///   styles work. The menu can only show one shortcut per item.
+    func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self,
+                  !(event.window is NSPanel),
+                  !(event.window?.firstResponder is NSText && event.keyCode == 49)
+            else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            if event.keyCode == 49, flags.isEmpty {
+                if !event.isARepeat { self.togglePlayback() }
+                return nil
+            }
+
+            let withOption = flags == [.command, .option]
+            guard flags == [.command] || withOption else { return event }
+            switch event.keyCode {
+            case 125: withOption ? self.selectAdjacentCategory(1) : self.selectAdjacentPatch(1)
+            case 126: withOption ? self.selectAdjacentCategory(-1) : self.selectAdjacentPatch(-1)
+            case 124: withOption ? self.shiftOctave(1) : self.shiftRoot(1)
+            case 123: withOption ? self.shiftOctave(-1) : self.shiftRoot(-1)
+            default: return event
+            }
+            return nil
+        }
+    }
+
+    func togglePlayback() {
+        isPlaying ? stop() : play()
+    }
+
     func stop() {
+        isTestTone = false
         stateLock.lock()
         playbackGeneration &+= 1
         stateLock.unlock()
         player.stopAll()
+        midi.allNotesOff()
         isPlaying = false
         currentNoteNames = []
         playbackMessage = ""
@@ -308,7 +606,10 @@ final class AppModel: ObservableObject {
         do {
             try player.prepare()
         } catch {
-            playbackMessage = "Audio engine could not start: \(error.localizedDescription)"
+            playbackMessage = tr(
+                "Audio engine could not start: \(error.localizedDescription)",
+                "오디오 엔진을 시작할 수 없습니다: \(error.localizedDescription)"
+            )
             return
         }
 
@@ -318,14 +619,19 @@ final class AppModel: ObservableObject {
         stateLock.unlock()
 
         isPlaying = true
-        let root = rootURL
-        let library = selectedInstrument?.library ?? ""
+        isTestTone = true
+        let (root, library) = resolverLocation
         let groupIndex = selectedGroupIndex
         let holdForTest = pedalHold
+        let target = activeMIDITarget
+        let useInternal = internalSound || target == nil
+        if holdForTest, let target { midi.sustain(true, target: target) }
         playbackQueue.async { [weak self] in
             guard let self else { return }
             var wait: TimeInterval = 1.5
-            if let zone = self.selectZone(parsed: parsed, groupIndex: groupIndex, midi: 60, velocity: 100),
+            var prepared: [PreparedNote] = []
+            if useInternal,
+               let zone = self.selectZone(parsed: parsed, groupIndex: groupIndex, midi: 60, velocity: 100),
                let note = self.prepareNote(
                    zone: zone,
                    parsed: parsed,
@@ -333,11 +639,12 @@ final class AppModel: ObservableObject {
                    rootURL: root,
                    libraryName: library
                ) {
-                self.playNotes([note], duration: 1.4, hold: holdForTest, generation: generation)
+                prepared = [note]
                 if holdForTest {
                     wait = min(12, max(1.5, note.naturalDuration))
                 }
             }
+            self.playNotes(prepared, midiNotes: [60], target: target, duration: 1.4, hold: holdForTest, generation: generation)
             Thread.sleep(forTimeInterval: wait)
             self.finishIfCurrent(generation)
         }
@@ -353,6 +660,8 @@ final class AppModel: ObservableObject {
         loop: Bool,
         together: Bool,
         hold: Bool,
+        midiTarget: MIDITarget?,
+        useInternal: Bool,
         generation: UInt64
     ) {
         repeat {
@@ -363,7 +672,8 @@ final class AppModel: ObservableObject {
                 var notes: [PreparedNote] = []
                 for midi in plan.midiNotes {
                     if !isCurrent(generation) { return }
-                    if let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
+                    if useInternal,
+                       let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
                        let note = prepareNote(
                            zone: zone,
                            parsed: parsed,
@@ -374,7 +684,14 @@ final class AppModel: ObservableObject {
                         notes.append(note)
                     }
                 }
-                playNotes(notes, duration: duration, hold: hold, generation: generation)
+                playNotes(
+                    notes,
+                    midiNotes: plan.midiNotes,
+                    target: midiTarget,
+                    duration: duration,
+                    hold: hold,
+                    generation: generation
+                )
                 updateCurrentNotes(plan.names, generation: generation)
                 let ring = notes.map(\.naturalDuration).max() ?? 0
                 let interval = hold ? min(12, max(noteLength, ring)) : duration + 0.12
@@ -383,7 +700,9 @@ final class AppModel: ObservableObject {
                 var lastNaturalDuration: TimeInterval = 0
                 for (index, midi) in plan.midiNotes.enumerated() {
                     if !isCurrent(generation) { return }
-                    if let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
+                    var notes: [PreparedNote] = []
+                    if useInternal,
+                       let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
                        let note = prepareNote(
                            zone: zone,
                            parsed: parsed,
@@ -392,8 +711,16 @@ final class AppModel: ObservableObject {
                            libraryName: libraryName
                        ) {
                         lastNaturalDuration = note.naturalDuration
-                        playNotes([note], duration: noteLength, hold: hold, generation: generation)
+                        notes = [note]
                     }
+                    playNotes(
+                        notes,
+                        midiNotes: [midi],
+                        target: midiTarget,
+                        duration: noteLength,
+                        hold: hold,
+                        generation: generation
+                    )
                     updateCurrentNotes([plan.names[index]], generation: generation)
                     sleepInterruptibly(noteLength, generation: generation)
                 }
@@ -459,8 +786,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func playNotes(_ notes: [PreparedNote], duration: Double, hold: Bool, generation: UInt64) {
-        guard !notes.isEmpty, isCurrent(generation) else { return }
+    /// Starts the built-in voices and, when MIDI out is on, the same notes on the MIDI port.
+    /// Each MIDI note ends after `duration`; the pedal (when held) is released in `finishIfCurrent`.
+    private func playNotes(
+        _ notes: [PreparedNote],
+        midiNotes: [Int],
+        target: MIDITarget?,
+        duration: Double,
+        hold: Bool,
+        generation: UInt64
+    ) {
+        guard !(notes.isEmpty && (target == nil || midiNotes.isEmpty)), isCurrent(generation) else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isCurrent(generation) else { return }
             for note in notes {
@@ -472,6 +808,18 @@ final class AppModel: ObservableObject {
                     duration: duration,
                     hold: hold
                 )
+            }
+            guard let target else { return }
+            for note in midiNotes {
+                self.midi.noteOn(note, target: target)
+            }
+            // stop() already ends active notes, so a stale generation must not send a late
+            // note-off that would cut a note of the playback that replaced it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                guard let self, self.isCurrent(generation) else { return }
+                for note in midiNotes {
+                    self.midi.noteOff(note, target: target)
+                }
             }
         }
     }
@@ -557,6 +905,7 @@ final class AppModel: ObservableObject {
             let current = self.playbackGeneration
             self.stateLock.unlock()
             guard current == generation else { return }
+            self.midi.allNotesOff()
             self.isPlaying = false
             self.currentNoteNames = []
             self.playbackMessage = ""

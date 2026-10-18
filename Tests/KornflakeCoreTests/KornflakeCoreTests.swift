@@ -16,6 +16,46 @@ final class KornflakeCoreTests: XCTestCase {
         XCTAssertEqual(K2PathDecoder.decodePercentEscapes("Cafe%20Au%%Lait"), "Cafe Au%Lait")
     }
 
+    func testScaleUpDown() {
+        func plan(descending: Bool = false, seamless: Bool = false) -> [Int] {
+            AuditionBuilder.makePlan(
+                mode: .scale,
+                rootPitchClass: 0,
+                octave: 4,
+                scale: ScaleType.all[0],
+                chord: ChordType.all[0],
+                descending: descending,
+                twoOctaves: false,
+                upDown: true,
+                seamless: seamless
+            ).midiNotes
+        }
+        XCTAssertEqual(plan(), [60, 62, 64, 65, 67, 69, 71, 72, 71, 69, 67, 65, 64, 62, 60])
+        XCTAssertEqual(plan(seamless: true), [60, 62, 64, 65, 67, 69, 71, 72, 71, 69, 67, 65, 64, 62])
+        XCTAssertEqual(plan(descending: true), [72, 71, 69, 67, 65, 64, 62, 60, 62, 64, 65, 67, 69, 71, 72])
+    }
+
+    func testChordExtension() {
+        func plan(up: Int, down: Int, descending: Bool = false) -> [Int] {
+            AuditionBuilder.makePlan(
+                mode: .chord,
+                rootPitchClass: 0,
+                octave: 4,
+                scale: ScaleType.all[0],
+                chord: ChordType.all[0],
+                descending: descending,
+                twoOctaves: false,
+                extendUp: up,
+                extendDown: down
+            ).midiNotes
+        }
+        XCTAssertEqual(plan(up: 0, down: 0), [60, 64, 67])
+        XCTAssertEqual(plan(up: 2, down: 0), [60, 64, 67, 72, 76])
+        XCTAssertEqual(plan(up: 0, down: 1), [55, 60, 64, 67])
+        XCTAssertEqual(plan(up: 1, down: 4), [43, 48, 52, 55, 60, 64, 67, 72])
+        XCTAssertEqual(plan(up: 1, down: 1, descending: true), [72, 67, 64, 60, 55])
+    }
+
     func testAuditionBuilder() {
         let scale = AuditionBuilder.makePlan(
             mode: .scale,
@@ -210,5 +250,47 @@ final class KornflakeCoreTests: XCTestCase {
         XCTAssertGreaterThan(all.filter(\.isPlayable).count, 5_000)
         XCTAssertTrue(all.contains { $0.format == .k2 })
         XCTAssertTrue(all.contains { $0.format == .k5 })
+    }
+}
+
+import CoreMIDI
+
+final class MIDIOutputTests: XCTestCase {
+    /// Subscribes to the "Kornflake" virtual source and checks the notes that arrive.
+    func testVirtualPortDeliversNotes() throws {
+        let output = MIDIOutput()
+
+        var client = MIDIClientRef()
+        XCTAssertEqual(MIDIClientCreate("test" as CFString, nil, nil, &client), noErr)
+        let lock = NSLock()
+        var received: [UInt32] = []
+        var port = MIDIPortRef()
+        let status = MIDIInputPortCreateWithProtocol(client, "in" as CFString, ._1_0, &port) { list, _ in
+            var packet = list.pointee.packet
+            for _ in 0..<list.pointee.numPackets {
+                let count = Int(packet.wordCount)
+                let words = withUnsafePointer(to: &packet.words) {
+                    $0.withMemoryRebound(to: UInt32.self, capacity: 64) { Array(UnsafeBufferPointer(start: $0, count: count)) }
+                }
+                lock.lock(); received += words; lock.unlock()
+                packet = MIDIEventPacketNext(&packet).pointee
+            }
+        }
+        XCTAssertEqual(status, noErr)
+
+        var endpoint = MIDIObjectRef()
+        var type = MIDIObjectType.other
+        XCTAssertEqual(MIDIObjectFindByUniqueID(output.sourceUniqueID, &endpoint, &type), noErr)
+        XCTAssertEqual(MIDIPortConnectSource(port, endpoint, nil), noErr)
+
+        let target = MIDITarget(channel: 2, destinationID: nil)
+        output.noteOn(60, velocity: 100, target: target)
+        output.noteOff(60, target: target)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        lock.lock(); let words = received; lock.unlock()
+        XCTAssertEqual(words, [0x2092_3C64, 0x2082_3C00])
+        MIDIPortDispose(port)
+        MIDIClientDispose(client)
     }
 }
