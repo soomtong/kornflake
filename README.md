@@ -5,6 +5,8 @@ Yamaha Motif ES Kontakt 악기의 실제 샘플을 Kontakt Player 없이 들어�
 패치를 고른 뒤 근음·스케일·코드를 선택해 순차 또는 동시에 재생할 수 있습니다.
 키보드만으로 조작할 수 있도록 단축키를 제공하며, UI는 한국어/영어로 전환할 수 있습니다.
 
+![Kornflake 실행 화면](screenshot.png)
+
 ```
 Samples/Yamaha Motif ES/            ← 악기 폴더 (git 제외)
   01 Acoustic Piano/01 FullGrand.nki   카테고리 폴더 = 사이드 패널 그룹, .nki = 패치
@@ -16,14 +18,12 @@ Samples/Yamaha Motif ES/            ← 악기 폴더 (git 제외)
 
 ## 1. 먼저 확인한 사실
 
-이 컬렉션의 `.nki` 파일을 전수 조사한 결과는 다음과 같습니다.
-
-| 구분 | 수량 | Kontakt Player 없이 재생 |
-|---|---:|---|
-| 전체 `.nki` | 6,882 | — |
-| Kontakt 2/3 (비암호화, zlib XML) | 5,406 | 가능 |
-| Kontakt 4.2 (FastLZ 바이너리) | 1 | 미지원 |
-| Kontakt 5+ (`hsin` 컨테이너, 암호화) | 1,475 | 불가능 |
+| 구분 | Kontakt Player 없이 재생 |
+|---|---|
+| 전체 `.nki` | — |
+| Kontakt 2/3 (비암호화, zlib XML) | 가능 |
+| Kontakt 4.2 (FastLZ 바이너리) | 미지원 |
+| Kontakt 5+ (`hsin` 컨테이너, 암호화) | 불가능 |
 
 Kontakt 5+ 파일은 내부 프리셋이 `SUBTREE` + `ENCRYPT` 청크로 암호화되어 있습니다.
 예: Alicia's Keys, Noire, Play Series, Session Guitarist, Symphony Essentials 등.
@@ -33,24 +33,6 @@ Kontakt 5+ 파일은 내부 프리셋이 `SUBTREE` + `ENCRYPT` 청크로 암호�
 반면 Kontakt 2/3 세대의 DRM-free 악기는 프리셋이 zlib 압축 XML로 저장되어 있어
 샘플 매핑(키 범위, 벨로시티, 루트키, 샘플 경로)을 직접 읽을 수 있습니다.
 
-### 실제로 샘플까지 찾아지는 악기
-
-| 라이브러리 | DRM-free 악기 수 | 샘플 형태 |
-|---|---:|---|
-| E-mu Pack | 3,304 | 외부 WAV |
-| Ensoniq ASR | 808 | 외부 WAV |
-| Vintage Pro | 505 | 외부 WAV |
-| Yamaha Motif ES | 402 | `.nki` 모놀리스 내장 WAV |
-| Virtuoso | 256 | 외부 WAV |
-| 합계 | 5,275 | |
-
-이 중 5,269개는 첫 샘플 경로까지 확인되었습니다.
-Yamaha Motif ES의 나머지 6개는 모놀리스 헤더만 있고 XML 매핑이 없는 복사본입니다.
-
-K2 파일 5,406개 중 137개는 XML 매핑을 찾지 못했습니다(일부는 K5 스타일이거나
-샘플 폴더가 없는 복사본). 앱은 매핑이 확인된 K2만 패치 목록에 표시합니다.
-일부 모놀리스는 헤더만으로 판정하므로 선택 시 오류가 날 수 있습니다.
-
 > 요약: Kontakt Player 없이 실제 음색을 재생하려면 DRM-free K2 계열만 가능합니다.
 > 보호된 K5 라이브러리는 정식 Kontakt/Kontakt Player가 필요합니다.
 
@@ -58,7 +40,7 @@ K2 파일 5,406개 중 137개는 XML 매핑을 찾지 못했습니다(일부는 
 
 ## 2. 동작 방식
 
-Kontakt 엔진이나 별도 샘플러를 새로 만들지 않습니다.
+Kontakt 엔진이나 별도 샘플러를 만들지 않습니다.
 
 1. `.nki` 헤더를 읽어 Kontakt 2/3 / 4.2 / 5+ 형식을 구분합니다.
 2. K2 파일의 zlib 스트림을 풀어 `K2_Container` XML을 파싱합니다.
@@ -287,35 +269,7 @@ swift test
 
 ---
 
-## 7. 프로젝트 구조
-
-```
-Sources/KornflakeCore/
-  Models.swift            데이터 모델, 스케일/코드 정의
-  KontaktScanner.swift    폴더 스캔 및 형식 감지
-  K2Parser.swift          K2 헤더/zlib/XML/경로 디코딩
-  K2Monolith.swift        모놀리스 내장 샘플 인덱스/추출
-  SampleResolver.swift    샘플 경로 해석 + basename fallback
-  AudioSampleLoader.swift WAV/AIFF 로드, 44.1k stereo 변환, 트림/fade
-  PreviewPlayer.swift     24-voice 미리보기 플레이어
-  MIDIOutput.swift        CoreMIDI 출력: 가상 소스 "Kornflake", 포트/채널 전송
-  Audition.swift          스케일/코드 노트 생성
-Sources/Kornflake/
-  KornflakeApp.swift      SwiftUI 앱 진입점, 메뉴/단축키
-  AppModel.swift          폴더 로딩/파싱/재생 상태 머신, 키보드 탐색
-  Localization.swift      한국어/영어 문자열, 카테고리 이름/아이콘, 스케일/코드 번역
-  ContentView.swift       사이드 패널(카테고리별 패치) + 상세 2-column UI
-Samples/                  악기 폴더 (git 제외)
-scripts/build-app.sh      .app 번들 생성
-scripts/make-icon.sh      AppIcon.icns 재생성
-scripts/make-icon.swift   아이콘 드로잉 소스
-assets/AppIcon.icns       macOS 앱 아이콘
-assets/AppIcon-1024.png   아이콘 원본
-```
-
----
-
-## 8. 참고
+## 7. 참고
 
 - ConvertWithMoss (Jürgen Moßgraber, LGPLv3) — K2/K5 NKI 구조와 모놀리스 포맷 조사에 참고
 - monomadic/ncw (MIT/Apache-2.0) — NCW 포맷 조사 (이 앱에는 미포함)
