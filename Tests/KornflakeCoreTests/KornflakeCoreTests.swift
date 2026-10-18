@@ -294,3 +294,43 @@ final class MIDIOutputTests: XCTestCase {
         MIDIClientDispose(client)
     }
 }
+
+import Compression
+
+/// Synthetic inputs that exercise the parser's defences against corrupt or hostile files.
+final class K2RobustnessTests: XCTestCase {
+    private func temporaryFile(_ bytes: [UInt8]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kornflake-\(UUID().uuidString).nki")
+        try Data(bytes).write(to: url)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    private func littleEndian(_ value: UInt32) -> [UInt8] {
+        (0..<4).map { UInt8((value >> (8 * UInt32($0))) & 0xFF) }
+    }
+
+    func testMonolithIndexRejectsOverflowingWallpaperLength() throws {
+        // 170-byte K2 header, then a wallpaper block whose length would overflow UInt64.
+        var bytes = [UInt8](repeating: 0, count: 170)
+        bytes += littleEndian(0x2AE9_05FA)
+        bytes += [UInt8](repeating: 0, count: 10)
+        bytes += [UInt8](repeating: 0xFF, count: 8)
+        let url = try temporaryFile(bytes)
+        XCTAssertThrowsError(try K2MonolithIndex.read(url: url))
+    }
+
+    func testMonolithIndexSkipsSampleBlockPastEndOfFile() throws {
+        // A sample block that claims 4 GB of audio in a file a few hundred bytes long.
+        var bytes = [UInt8](repeating: 0, count: 170)
+        bytes += littleEndian(0x16CC_F80A)
+        var header = [UInt8](repeating: 0, count: 27)
+        header.replaceSubrange(15..<19, with: littleEndian(0xFFFF_FFFF))
+        bytes += header
+        bytes += [UInt8](repeating: 0, count: 64)
+        let url = try temporaryFile(bytes)
+        let index = try K2MonolithIndex.read(url: url)
+        XCTAssertTrue(index.extentsByName.isEmpty)
+    }
+}

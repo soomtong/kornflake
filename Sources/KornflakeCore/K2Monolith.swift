@@ -77,7 +77,10 @@ public struct K2MonolithIndex: Sendable {
                 let header = try read(at: position + 4, count: 18)
                 guard header.count >= 18 else { throw K2Error.monolithUnreadable }
                 let length = header.readUInt64(at: 10, littleEndian: true)
-                position += 4 + 18 + length
+                // The length comes from the file; a corrupt value must not trap on overflow.
+                let (next, overflow) = (position + 4 + 18).addingReportingOverflow(length)
+                guard !overflow, next <= fileSize else { throw K2Error.monolithUnreadable }
+                position = next
 
             case nkiHeader:
                 // The mapping XML starts here (after a 27-byte NKI header + 170-byte K2 header).
@@ -88,6 +91,12 @@ public struct K2MonolithIndex: Sendable {
                 guard header.count >= 27 else { throw K2Error.monolithUnreadable }
                 let length = Int(header.readUInt32(at: 15, littleEndian: true))
                 let dataOffset = position + 4 + 27
+                // A block that runs past the end of the file is truncated or corrupt. Keep the
+                // samples found so far and stop indexing instead of recording an unreadable extent.
+                guard dataOffset + UInt64(length) <= fileSize else {
+                    position = fileSize
+                    continue
+                }
                 extents.append(SampleExtent(offset: dataOffset, length: length, name: ""))
                 position = dataOffset + UInt64(length)
 
@@ -184,13 +193,35 @@ public struct K2MonolithIndex: Sendable {
 
         let handle = try FileHandle(forReadingFrom: sourceURL)
         defer { try? handle.close() }
+        let fileSize = try handle.seekToEnd()
+        guard extent.offset + UInt64(extent.length) <= fileSize else { throw K2Error.monolithUnreadable }
         try handle.seek(toOffset: extent.offset)
-        guard let data = try handle.read(upToCount: extent.length), data.count == extent.length else {
+
+        // Copy in chunks so a multi-minute sample never has to sit in memory as a whole.
+        let temporary = destination.appendingPathExtension("tmp")
+        try? fileManager.removeItem(at: temporary)
+        guard fileManager.createFile(atPath: temporary.path, contents: nil) else {
             throw K2Error.monolithUnreadable
         }
+        let output = try FileHandle(forWritingTo: temporary)
+        var copied = 0
+        do {
+            let chunkSize = 4 << 20
+            while copied < extent.length {
+                let want = min(chunkSize, extent.length - copied)
+                guard let chunk = try handle.read(upToCount: want), !chunk.isEmpty else {
+                    throw K2Error.monolithUnreadable
+                }
+                try output.write(contentsOf: chunk)
+                copied += chunk.count
+            }
+            try output.close()
+        } catch {
+            try? output.close()
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
 
-        let temporary = destination.appendingPathExtension("tmp")
-        try data.write(to: temporary, options: .atomic)
         if fileManager.fileExists(atPath: destination.path) {
             try? fileManager.removeItem(at: destination)
         }
