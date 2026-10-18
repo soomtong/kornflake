@@ -142,10 +142,10 @@ public final class AudioSampleLoader: @unchecked Sendable {
         }
     }
 
+    /// Sample libraries do not change while the app runs, so the key does not include the
+    /// modification time; that keeps the cache hit path free of a stat call per note.
     private func cacheKey(url: URL, start: Int, end: Int) -> String {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        return "\(url.path)|\(mtime)|\(start)|\(end)"
+        "\(url.path)|\(start)|\(end)"
     }
 
     private func touch(_ key: String) {

@@ -8,6 +8,9 @@ public final class SampleResolver: @unchecked Sendable {
     private let libraryURL: URL
     private let lock = NSLock()
     private var basenameIndex: [String: URL]?
+    /// Zone to file mapping found so far. Resolving walks several candidate paths (and, for
+    /// monoliths, hashes and extracts), so each zone is only resolved once per session.
+    private var resolvedByZone: [String: URL] = [:]
 
     public init(rootURL: URL, libraryName: String) {
         self.rootURL = rootURL
@@ -15,6 +18,23 @@ public final class SampleResolver: @unchecked Sendable {
     }
 
     public func resolve(zone: K2Zone, in instrument: ParsedInstrument) throws -> URL {
+        let cacheKey = "\(instrument.sourceURL.path)|\(zone.index)|\(zone.sampleName)"
+        lock.lock()
+        let cached = resolvedByZone[cacheKey]
+        lock.unlock()
+        // One stat to notice an extracted monolith sample that was removed from the cache folder.
+        if let cached, FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+
+        let url = try locate(zone: zone, in: instrument)
+        lock.lock()
+        resolvedByZone[cacheKey] = url
+        lock.unlock()
+        return url
+    }
+
+    private func locate(zone: K2Zone, in instrument: ParsedInstrument) throws -> URL {
         if let monolith = instrument.monolith {
             return try monolith.sampleURL(named: zone.sampleName)
         }
