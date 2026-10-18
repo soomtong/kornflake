@@ -1,5 +1,12 @@
 import SwiftUI
 
+enum AppInfo {
+    /// CFBundleShortVersionString from the bundle's Info.plist; "dev" when running without a
+    /// bundle (swift run).
+    static let versionString: String =
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+}
+
 @main
 struct KornflakeApp: App {
     @StateObject private var model = AppModel()
@@ -40,6 +47,12 @@ struct KornflakeApp: App {
                     model.toggleLanguage()
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+
+                Divider()
+
+                // Shown disabled so the version is always visible without opening the About panel.
+                Button(model.tr("Version \(AppInfo.versionString)", "버전 \(AppInfo.versionString)")) {}
+                    .disabled(true)
             }
 
             CommandMenu(model.tr("Audition", "오디션")) {
