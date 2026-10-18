@@ -193,6 +193,10 @@ Sources/Kornflake/
   AppModel.swift          스캔/파싱/재생 상태 머신
   ContentView.swift       3-column UI
 scripts/build-app.sh      .app 번들 생성
+scripts/make-icon.sh      AppIcon.icns 재생성
+scripts/make-icon.swift   아이콘 드로잉 소스
+assets/AppIcon.icns       macOS 앱 아이콘
+assets/AppIcon-1024.png   아이콘 원본
 ```
 
 ---

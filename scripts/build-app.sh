@@ -5,12 +5,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/Kornflake.app"
 
 cd "$ROOT"
+
+if [ ! -f "$ROOT/assets/AppIcon.icns" ]; then
+    "$ROOT/scripts/make-icon.sh"
+fi
+
 swift build -c release
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$ROOT/.build/release/Kornflake" "$APP/Contents/MacOS/Kornflake"
+cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -21,6 +27,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>Kornflake</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.kornflake.preview</string>
     <key>CFBundleInfoDictionaryVersion</key>

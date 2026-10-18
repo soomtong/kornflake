@@ -4,3 +4,4 @@ dist/
 assets/AppIcon.iconset/
 *.xcodeproj
 Kornflake.app/
+Samples/
