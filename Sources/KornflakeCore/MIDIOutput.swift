@@ -40,15 +40,33 @@ public final class MIDIOutput: @unchecked Sendable {
     private let lock = NSLock()
     private var activeNotes = Set<ActiveNote>()
     private var sustainTargets = Set<MIDITarget>()
+    /// Destination endpoints resolved from their unique ID. Looking an endpoint up walks the
+    /// whole MIDI device tree, so cache it and drop the cache when the setup changes.
+    private var endpointsByID: [Int32: MIDIObjectRef] = [:]
+    private var setupChangedHandler: (() -> Void)?
 
     /// Called on an arbitrary thread when ports appear or disappear.
-    public var onSetupChanged: (() -> Void)?
+    public var onSetupChanged: (() -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return setupChangedHandler
+        }
+        set {
+            lock.lock()
+            setupChangedHandler = newValue
+            lock.unlock()
+        }
+    }
 
     public init() {
         MIDIClientCreateWithBlock(Self.virtualPortName as CFString, &client) { [weak self] notification in
-            if notification.pointee.messageID == .msgSetupChanged {
-                self?.onSetupChanged?()
-            }
+            guard let self, notification.pointee.messageID == .msgSetupChanged else { return }
+            self.lock.lock()
+            self.endpointsByID.removeAll()
+            let handler = self.setupChangedHandler
+            self.lock.unlock()
+            handler?()
         }
         MIDIOutputPortCreate(client, "Kornflake Out" as CFString, &outputPort)
         MIDISourceCreateWithProtocol(client, Self.virtualPortName as CFString, ._1_0, &source)
@@ -138,21 +156,37 @@ public final class MIDIOutput: @unchecked Sendable {
             | UInt32(data1 & 0x7F) << 8
             | UInt32(data2 & 0x7F)
 
-        let size = 256
-        let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)
-        defer { raw.deallocate() }
-        let list = raw.bindMemory(to: MIDIEventList.self, capacity: 1)
-        let packet = MIDIEventListInit(list, ._1_0)
-        var words = [word]
-        _ = MIDIEventListAdd(list, size, packet, 0, 1, &words)
+        // Keep the event list on the stack so sending a note does not allocate.
+        let size = MemoryLayout<MIDIEventList>.size
+        withUnsafeTemporaryAllocation(byteCount: size, alignment: MemoryLayout<MIDIEventList>.alignment) { raw in
+            let list = raw.baseAddress!.bindMemory(to: MIDIEventList.self, capacity: 1)
+            let packet = MIDIEventListInit(list, ._1_0)
+            var words = word
+            _ = MIDIEventListAdd(list, size, packet, 0, 1, &words)
 
-        if let destinationID = target.destinationID {
-            var object = MIDIObjectRef()
-            var type = MIDIObjectType.other
-            guard MIDIObjectFindByUniqueID(destinationID, &object, &type) == noErr, object != 0 else { return }
-            MIDISendEventList(outputPort, object, list)
-        } else {
-            MIDIReceivedEventList(source, list)
+            if let destinationID = target.destinationID {
+                guard let endpoint = endpoint(forUniqueID: destinationID) else { return }
+                MIDISendEventList(outputPort, endpoint, list)
+            } else {
+                MIDIReceivedEventList(source, list)
+            }
         }
+    }
+
+    private func endpoint(forUniqueID uniqueID: Int32) -> MIDIObjectRef? {
+        lock.lock()
+        if let cached = endpointsByID[uniqueID] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        var object = MIDIObjectRef()
+        var type = MIDIObjectType.other
+        guard MIDIObjectFindByUniqueID(uniqueID, &object, &type) == noErr, object != 0 else { return nil }
+        lock.lock()
+        endpointsByID[uniqueID] = object
+        lock.unlock()
+        return object
     }
 }
