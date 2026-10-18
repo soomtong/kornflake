@@ -90,6 +90,15 @@ final class KornflakeCoreTests: XCTestCase {
         XCTAssertEqual(NoteLength.quarter.seconds(at: 60), 1.0, accuracy: 0.0001)
     }
 
+    func testLegatoNoteDuration() {
+        // Each note ends one overlap after the next note starts, whatever the step.
+        let step = NoteLength.eighth.seconds(at: 120)
+        XCTAssertEqual(Legato.noteDuration(step: step), step + Legato.overlap, accuracy: 0.0001)
+        XCTAssertGreaterThan(Legato.noteDuration(step: step), step)
+        XCTAssertEqual(Legato.noteDuration(step: 0), Legato.overlap, accuracy: 0.0001)
+        XCTAssertEqual(Legato.noteDuration(step: -1), Legato.overlap, accuracy: 0.0001)
+    }
+
     func testParseVirtuoso() throws {
         let url = root.appendingPathComponent("Virtuoso/Orchestral  Winds, Brass, & Percussion/Piccolo 2.nki")
         try XCTSkipUnless(FileManager.default.fileExists(atPath: url.path))

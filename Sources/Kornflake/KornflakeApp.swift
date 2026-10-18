@@ -150,6 +150,8 @@ struct KornflakeApp: App {
                     .keyboardShortcut("a", modifiers: [.option])
                 Button(model.tr("Pedal Hold", "페달 홀드")) { model.pedalHold.toggle() }
                     .keyboardShortcut("p", modifiers: [.option])
+                Button(model.tr("Legato", "레가토")) { model.legato.toggle() }
+                    .keyboardShortcut("g", modifiers: [.option])
 
                 Divider()
 

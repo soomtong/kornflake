@@ -273,6 +273,17 @@ public enum NoteLength: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Legato timing for sequential playback. Each note keeps sounding until the next one has
+/// started, and the overlap doubles as the crossfade between the two samples.
+public enum Legato {
+    /// How long a note rings on after the next note starts.
+    public static let overlap: TimeInterval = 0.05
+
+    public static func noteDuration(step: TimeInterval) -> TimeInterval {
+        max(0, step) + overlap
+    }
+}
+
 
 public struct ScaleType: Identifiable, Hashable, Sendable {
     public let id: String

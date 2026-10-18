@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     @Published var stepLength: NoteLength = .quarter
     @Published var tempo: Double = 120
     @Published var pedalHold = false
+    /// Sequential notes ring into the next one instead of stopping at the note length.
+    @Published var legato = false
     /// Restart playback when a control changes while playing, so the new setting is heard at once.
     @Published var autoPlayback = true
 
@@ -136,6 +138,7 @@ final class AppModel: ObservableObject {
             $stepLength.map { _ in }.eraseToAnyPublisher(),
             $tempo.map { _ in }.eraseToAnyPublisher(),
             $pedalHold.map { _ in }.eraseToAnyPublisher(),
+            $legato.map { _ in }.eraseToAnyPublisher(),
             $loop.map { _ in }.eraseToAnyPublisher(),
             $selectedGroupIndex.map { _ in }.eraseToAnyPublisher(),
             $midiEnabled.map { _ in }.eraseToAnyPublisher(),
@@ -342,6 +345,16 @@ final class AppModel: ObservableObject {
         stepLength.seconds(at: tempo)
     }
 
+    /// Legato only applies to sequential playback; together, every note already overlaps.
+    var isLegatoActive: Bool {
+        legato && sequential
+    }
+
+    /// How long each note sounds: the note length, or in legato up to just past the next note.
+    var playedNoteDuration: TimeInterval {
+        isLegatoActive ? Legato.noteDuration(step: stepDuration) : noteDuration
+    }
+
     var plannedPlan: AuditionPlan {
         AuditionBuilder.makePlan(
             mode: mode,
@@ -529,11 +542,13 @@ final class AppModel: ObservableObject {
         guard !plan.midiNotes.isEmpty else { return }
         let groupIndex = selectedGroupIndex
         let (root, library) = resolverLocation
-        let length = noteDuration
+        let length = playedNoteDuration
         let step = stepDuration
         let shouldLoop = loop
         let together = !sequential
-        let hold = pedalHold
+        // Legato decides where each note ends, so it overrides the pedal.
+        let hold = pedalHold && !isLegatoActive
+        let fadeOut = isLegatoActive ? Legato.overlap : PreviewPlayer.defaultFadeOut
         let target = activeMIDITarget
         let useInternal = internalSound || target == nil
 
@@ -557,6 +572,7 @@ final class AppModel: ObservableObject {
                 loop: shouldLoop,
                 together: together,
                 hold: hold,
+                fadeOut: fadeOut,
                 midiTarget: target,
                 useInternal: useInternal,
                 generation: generation
@@ -673,6 +689,7 @@ final class AppModel: ObservableObject {
         loop: Bool,
         together: Bool,
         hold: Bool,
+        fadeOut: TimeInterval,
         midiTarget: MIDITarget?,
         useInternal: Bool,
         generation: UInt64
@@ -725,6 +742,7 @@ final class AppModel: ObservableObject {
                         target: midiTarget,
                         duration: noteLength,
                         hold: hold,
+                        fadeOut: fadeOut,
                         generation: generation
                     )
                     updateCurrentNotes([plan.names[index]], generation: generation)
@@ -808,6 +826,7 @@ final class AppModel: ObservableObject {
         target: MIDITarget?,
         duration: Double,
         hold: Bool,
+        fadeOut: TimeInterval = PreviewPlayer.defaultFadeOut,
         generation: UInt64
     ) {
         guard !(notes.isEmpty && (target == nil || midiNotes.isEmpty)) else { return }
@@ -822,7 +841,8 @@ final class AppModel: ObservableObject {
                     gain: note.gain,
                     pan: note.pan,
                     duration: duration,
-                    hold: hold
+                    hold: hold,
+                    fadeOut: fadeOut
                 )
             }
             guard let target else { return }

@@ -442,9 +442,10 @@ struct ContentView: View {
                             options: NoteLength.allCases.map { (value: $0, label: $0.rawValue) },
                             width: 110
                         )
+                        .disabled(model.isLegatoActive)
                     }
                     Param(model.tr("Duration", "길이")) {
-                        LCDReadout(text: "\(Int(model.noteDuration * 1000)) ms", minWidth: 70)
+                        LCDReadout(text: "\(Int(model.playedNoteDuration * 1000)) ms", minWidth: 70)
                     }
                     if model.sequential {
                         Param(model.tr("Rate", "진행 간격")) {
@@ -471,7 +472,14 @@ struct ContentView: View {
                 }
 
                 FlowLayout(spacing: 8) {
+                    DAWToggle(title: model.tr("Legato", "레가토"), isOn: $model.legato)
+                        .disabled(!model.sequential)
+                        .help(model.tr(
+                            "Sequential only. Each note rings into the next and crossfades with it, ignoring Note length and Pedal hold.",
+                            "순차 재생 전용입니다. 각 음이 다음 음까지 이어져 겹치며 넘어갑니다. 음 길이와 페달 홀드는 무시합니다."
+                        ))
                     DAWToggle(title: model.tr("Pedal hold (natural decay)", "페달 홀드 (자연 감쇠)"), isOn: $model.pedalHold)
+                        .disabled(model.isLegatoActive)
                         .help(model.tr("Let each note ring until the sample's own decay instead of cutting it at the note length.", "음 길이에서 자르지 않고 샘플 고유의 감쇠가 끝날 때까지 울리게 합니다."))
                     DAWToggle(title: model.tr("Auto replay on change", "변경 시 자동 재생"), isOn: $model.autoPlayback)
                         .help(model.tr(

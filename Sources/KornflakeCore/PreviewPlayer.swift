@@ -54,7 +54,11 @@ public final class PreviewPlayer: @unchecked Sendable {
         prepared = true
     }
 
-    /// Plays one note. `rate` is a sampler-style speed/pitch ratio.
+    /// Fade applied to the end of a note cut at its length.
+    public static let defaultFadeOut: TimeInterval = 0.02
+
+    /// Plays one note. `rate` is a sampler-style speed/pitch ratio. `fadeOut` is the fade at
+    /// the end of a note cut at `duration`; legato passes its overlap so the notes crossfade.
     /// Safe to call from any thread; voice state and node calls are serialized by the lock.
     public func play(
         buffer: AVAudioPCMBuffer,
@@ -62,7 +66,8 @@ public final class PreviewPlayer: @unchecked Sendable {
         gain: Float,
         pan: Float,
         duration: TimeInterval,
-        hold: Bool = false
+        hold: Bool = false,
+        fadeOut: TimeInterval = PreviewPlayer.defaultFadeOut
     ) {
         guard buffer.frameLength > 0 else { return }
         let clampedRate = min(max(rate, 0.25), 4.0)
@@ -72,7 +77,7 @@ public final class PreviewPlayer: @unchecked Sendable {
             noteBuffer = buffer
             playbackDuration = Double(buffer.frameLength) / format.sampleRate / clampedRate
         } else {
-            noteBuffer = makeNoteBuffer(from: buffer, rate: clampedRate, duration: duration)
+            noteBuffer = makeNoteBuffer(from: buffer, rate: clampedRate, duration: duration, fadeOut: fadeOut)
             playbackDuration = min(
                 duration,
                 Double(noteBuffer.frameLength) / format.sampleRate / clampedRate
@@ -126,7 +131,12 @@ public final class PreviewPlayer: @unchecked Sendable {
         return voices.min(by: { $0.busyUntil < $1.busyUntil })
     }
 
-    private func makeNoteBuffer(from source: AVAudioPCMBuffer, rate: Double, duration: TimeInterval) -> AVAudioPCMBuffer {
+    private func makeNoteBuffer(
+        from source: AVAudioPCMBuffer,
+        rate: Double,
+        duration: TimeInterval,
+        fadeOut: TimeInterval
+    ) -> AVAudioPCMBuffer {
         let targetFrames = Int(min(
             Double(source.frameLength),
             duration * format.sampleRate * rate
@@ -144,7 +154,8 @@ public final class PreviewPlayer: @unchecked Sendable {
             memcpy(outputData[channel], sourceData[channel], targetFrames * MemoryLayout<Float>.size)
         }
 
-        let fadeFrames = min(targetFrames, Int(format.sampleRate * 0.02))
+        // The buffer plays at `rate`, so scale the fade to keep its length in output time.
+        let fadeFrames = min(targetFrames, Int(max(0, fadeOut) * format.sampleRate * rate))
         if fadeFrames > 1 {
             for channel in 0..<Int(format.channelCount) {
                 for i in 0..<fadeFrames {
