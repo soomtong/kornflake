@@ -20,6 +20,7 @@ let package = Package(
             name: "Kornflake",
             dependencies: ["KornflakeCore"],
             path: "Sources/Kornflake",
+            resources: [.copy("Resources")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

@@ -451,6 +451,7 @@ struct ContentView: View {
     private var welcome: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                welcomeHero
                 Text("Yamaha Motif Player")
                     .font(.system(size: 40, weight: .bold, design: .rounded))
                 Text(model.tr("Audition the patches of a single Kontakt instrument — without Kontakt Player.", "Kontakt Player 없이 Kontakt 악기 하나의 패치를 들어 봅니다."))
@@ -477,6 +478,30 @@ struct ContentView: View {
             }
             .padding(32)
             .frame(maxWidth: 720, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var welcomeHero: some View {
+        if let url = Bundle.module.url(forResource: "motif-hero", withExtension: "jpg", subdirectory: "Resources"),
+           let image = NSImage(contentsOf: url) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(height: 240)
+                .frame(maxWidth: .infinity)
+                .overlay(
+                    LinearGradient(colors: [.clear, .black.opacity(0.35)], startPoint: .center, endPoint: .bottom)
+                )
+                .overlay(alignment: .bottomTrailing) {
+                    Text("Yamaha Motif · Pixabay/hanmaili, CC0")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.8))
+                        .padding(10)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
+                .padding(.bottom, 6)
         }
     }
 
