@@ -101,7 +101,11 @@ final class AppModel: ObservableObject {
     private var isTestTone = false
     private let player = PreviewPlayer()
     private let playbackQueue = DispatchQueue(label: "kornflake.preview", qos: .userInitiated)
-    private let stateLock = NSLock()
+    /// MIDI note-off timers run here so main-thread UI work cannot delay them.
+    private let timingQueue = DispatchQueue(label: "kornflake.midi.timing", qos: .userInteractive)
+    /// Guards the generation counters. Also the condition that playback waits on, so stop()
+    /// wakes a sleeping sequence immediately instead of at the next poll.
+    private let stateLock = NSCondition()
     private var playbackGeneration: UInt64 = 0
     private var parseGeneration: UInt64 = 0
 
@@ -533,10 +537,7 @@ final class AppModel: ObservableObject {
         let target = activeMIDITarget
         let useInternal = internalSound || target == nil
 
-        stateLock.lock()
-        playbackGeneration &+= 1
-        let generation = playbackGeneration
-        stateLock.unlock()
+        let generation = advancePlaybackGeneration()
 
         if hold, let target { midi.sustain(true, target: target) }
         isPlaying = true
@@ -601,9 +602,9 @@ final class AppModel: ObservableObject {
 
     func stop() {
         isTestTone = false
-        stateLock.lock()
-        playbackGeneration &+= 1
-        stateLock.unlock()
+        // Bump first: any note send still in flight finishes under the lock before this
+        // returns, so the note-off sweep below catches it.
+        advancePlaybackGeneration()
         player.stopAll()
         midi.allNotesOff()
         isPlaying = false
@@ -625,10 +626,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        stateLock.lock()
-        playbackGeneration &+= 1
-        let generation = playbackGeneration
-        stateLock.unlock()
+        let generation = advancePlaybackGeneration()
 
         isPlaying = true
         isTestTone = true
@@ -657,7 +655,9 @@ final class AppModel: ObservableObject {
                 }
             }
             self.playNotes(prepared, midiNotes: [60], target: target, duration: 1.4, hold: holdForTest, generation: generation)
-            Thread.sleep(forTimeInterval: wait)
+            // Interruptible: this queue is serial, so a plain sleep here would hold back a
+            // Play pressed during the test tone until the sleep ended.
+            self.sleepInterruptibly(wait, generation: generation)
             self.finishIfCurrent(generation)
         }
     }
@@ -677,26 +677,26 @@ final class AppModel: ObservableObject {
         useInternal: Bool,
         generation: UInt64
     ) {
+        // Resolve and decode every note before the first one sounds. Decoding then never lands
+        // between two notes, and the same buffers serve every loop cycle.
+        var prepared: [PreparedNote?] = []
+        prepared.reserveCapacity(plan.midiNotes.count)
+        for midi in plan.midiNotes {
+            if !isCurrent(generation) { return }
+            var note: PreparedNote?
+            if useInternal,
+               let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100) {
+                note = prepareNote(zone: zone, parsed: parsed, midi: midi, rootURL: rootURL, libraryName: libraryName)
+            }
+            prepared.append(note)
+        }
+
         repeat {
             if !isCurrent(generation) { return }
 
             if together {
                 let duration = max(0.1, noteLength)
-                var notes: [PreparedNote] = []
-                for midi in plan.midiNotes {
-                    if !isCurrent(generation) { return }
-                    if useInternal,
-                       let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
-                       let note = prepareNote(
-                           zone: zone,
-                           parsed: parsed,
-                           midi: midi,
-                           rootURL: rootURL,
-                           libraryName: libraryName
-                       ) {
-                        notes.append(note)
-                    }
-                }
+                let notes = prepared.compactMap { $0 }
                 playNotes(
                     notes,
                     midiNotes: plan.midiNotes,
@@ -710,22 +710,15 @@ final class AppModel: ObservableObject {
                 let interval = hold ? min(12, max(noteLength, ring)) : duration + 0.12
                 sleepInterruptibly(interval, generation: generation)
             } else {
+                // Each note starts at a fixed offset from the cycle start, so the time spent
+                // starting one note never pushes the following notes later.
+                var slot = Date()
                 var lastNaturalDuration: TimeInterval = 0
                 for (index, midi) in plan.midiNotes.enumerated() {
+                    sleepInterruptibly(until: slot, generation: generation)
                     if !isCurrent(generation) { return }
-                    var notes: [PreparedNote] = []
-                    if useInternal,
-                       let zone = selectZone(parsed: parsed, groupIndex: groupIndex, midi: midi, velocity: 100),
-                       let note = prepareNote(
-                           zone: zone,
-                           parsed: parsed,
-                           midi: midi,
-                           rootURL: rootURL,
-                           libraryName: libraryName
-                       ) {
-                        lastNaturalDuration = note.naturalDuration
-                        notes = [note]
-                    }
+                    let notes = prepared[index].map { [$0] } ?? []
+                    if let note = notes.first { lastNaturalDuration = note.naturalDuration }
                     playNotes(
                         notes,
                         midiNotes: [midi],
@@ -735,12 +728,20 @@ final class AppModel: ObservableObject {
                         generation: generation
                     )
                     updateCurrentNotes([plan.names[index]], generation: generation)
-                    sleepInterruptibly(stepInterval, generation: generation)
+                    slot = slot.addingTimeInterval(stepInterval)
                 }
-                sleepInterruptibly(0.1, generation: generation)
-                if hold && !loop {
-                    sleepInterruptibly(min(12, max(1.0, lastNaturalDuration)), generation: generation)
+                // `slot` is now one step after the last note. When not looping, also let the last
+                // note finish: it may ring longer than a step, and the MIDI note-off must be sent
+                // before the final all-notes-off sweep cuts it.
+                var end = slot.addingTimeInterval(0.1)
+                if !loop {
+                    let lastStart = slot.addingTimeInterval(-stepInterval)
+                    end = max(end, lastStart.addingTimeInterval(noteLength + 0.1))
+                    if hold {
+                        end = max(end, lastStart.addingTimeInterval(min(12, max(1.0, lastNaturalDuration)) + 0.1))
+                    }
                 }
+                sleepInterruptibly(until: end, generation: generation)
             }
         } while loop && isCurrent(generation)
 
@@ -809,11 +810,13 @@ final class AppModel: ObservableObject {
         hold: Bool,
         generation: UInt64
     ) {
-        guard !(notes.isEmpty && (target == nil || midiNotes.isEmpty)), isCurrent(generation) else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isCurrent(generation) else { return }
+        guard !(notes.isEmpty && (target == nil || midiNotes.isEmpty)) else { return }
+        // Sent from the playback queue rather than hopping to the main thread, so UI rendering
+        // does not add jitter. `ifCurrent` holds the state lock, which keeps stop() from
+        // sweeping notes off between the generation check and the note-on.
+        ifCurrent(generation) {
             for note in notes {
-                self.player.play(
+                player.play(
                     buffer: note.buffer,
                     rate: note.rate,
                     gain: note.gain,
@@ -824,12 +827,15 @@ final class AppModel: ObservableObject {
             }
             guard let target else { return }
             for note in midiNotes {
-                self.midi.noteOn(note, target: target)
+                midi.noteOn(note, target: target)
             }
-            // stop() already ends active notes, so a stale generation must not send a late
-            // note-off that would cut a note of the playback that replaced it.
-            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
-                guard let self, self.isCurrent(generation) else { return }
+        }
+        guard let target else { return }
+        // stop() already ends active notes, so a stale generation must not send a late
+        // note-off that would cut a note of the playback that replaced it.
+        timingQueue.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self else { return }
+            self.ifCurrent(generation) {
                 for note in midiNotes {
                     self.midi.noteOff(note, target: target)
                 }
@@ -934,11 +940,37 @@ final class AppModel: ObservableObject {
         return current == generation
     }
 
+    /// Runs `body` only while `generation` is still current, holding the state lock throughout
+    /// so a concurrent stop() cannot slip in between the check and the work.
+    private func ifCurrent(_ generation: UInt64, _ body: () -> Void) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard playbackGeneration == generation else { return }
+        body()
+    }
+
+    /// Invalidates the running playback and wakes any sequence waiting in `sleepInterruptibly`.
+    @discardableResult
+    private func advancePlaybackGeneration() -> UInt64 {
+        stateLock.lock()
+        playbackGeneration &+= 1
+        let generation = playbackGeneration
+        stateLock.broadcast()
+        stateLock.unlock()
+        return generation
+    }
+
     private func sleepInterruptibly(_ seconds: Double, generation: UInt64) {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if !isCurrent(generation) { return }
-            Thread.sleep(forTimeInterval: min(0.02, deadline.timeIntervalSinceNow))
+        sleepInterruptibly(until: Date().addingTimeInterval(seconds), generation: generation)
+    }
+
+    /// Waits until `deadline` or until a newer playback replaces `generation`, whichever is first.
+    private func sleepInterruptibly(until deadline: Date, generation: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        while playbackGeneration == generation {
+            // wait(until:) returns false once the deadline has passed.
+            if !stateLock.wait(until: deadline) { return }
         }
     }
 }
