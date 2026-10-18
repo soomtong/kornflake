@@ -18,6 +18,8 @@ public final class PreviewPlayer: @unchecked Sendable {
     private var voices: [Voice] = []
     private var prepared = false
     private let lock = NSLock()
+    /// Note-off timers run here instead of on the main queue so UI work cannot delay them.
+    private let timing = DispatchQueue(label: "kornflake.preview.timing", qos: .userInteractive)
 
     public init() {
         self.format = AudioSampleLoader.shared.engineFormat
@@ -53,6 +55,7 @@ public final class PreviewPlayer: @unchecked Sendable {
     }
 
     /// Plays one note. `rate` is a sampler-style speed/pitch ratio.
+    /// Safe to call from any thread; voice state and node calls are serialized by the lock.
     public func play(
         buffer: AVAudioPCMBuffer,
         rate: Double,
@@ -61,7 +64,7 @@ public final class PreviewPlayer: @unchecked Sendable {
         duration: TimeInterval,
         hold: Bool = false
     ) {
-        guard let voice = allocateVoice(), buffer.frameLength > 0 else { return }
+        guard buffer.frameLength > 0 else { return }
         let clampedRate = min(max(rate, 0.25), 4.0)
         let noteBuffer: AVAudioPCMBuffer
         let playbackDuration: TimeInterval
@@ -76,6 +79,11 @@ public final class PreviewPlayer: @unchecked Sendable {
             )
         }
 
+        lock.lock()
+        guard let voice = allocateVoiceLocked() else {
+            lock.unlock()
+            return
+        }
         voice.generation &+= 1
         let generation = voice.generation
         voice.player.stop()
@@ -86,16 +94,16 @@ public final class PreviewPlayer: @unchecked Sendable {
         voice.player.scheduleBuffer(noteBuffer, at: nil, options: [], completionHandler: nil)
         voice.player.play()
         voice.busyUntil = Date().addingTimeInterval(playbackDuration + 0.1)
+        lock.unlock()
 
         let stopAt = playbackDuration + 0.03
-        DispatchQueue.main.asyncAfter(deadline: .now() + stopAt) { [weak self, weak voice] in
+        timing.asyncAfter(deadline: .now() + stopAt) { [weak self, weak voice] in
             guard let self, let voice else { return }
             self.lock.lock()
-            let current = voice.generation
-            self.lock.unlock()
-            if current == generation {
+            if voice.generation == generation {
                 voice.player.stop()
             }
+            self.lock.unlock()
         }
     }
 
@@ -109,9 +117,8 @@ public final class PreviewPlayer: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func allocateVoice() -> Voice? {
-        lock.lock()
-        defer { lock.unlock() }
+    /// Caller must hold `lock`.
+    private func allocateVoiceLocked() -> Voice? {
         let now = Date()
         if let free = voices.first(where: { $0.busyUntil < now }) {
             return free
