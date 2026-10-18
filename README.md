@@ -112,6 +112,10 @@ cd /Users/dp/Repository/kornflake
 open Kornflake.app
 ```
 
+배포용 DMG는 `./scripts/build-dist.sh`로 만듭니다. 앱을 빌드한 뒤 `dist/Kornflake-<버전>.dmg`를 만들고
+SHA-256을 출력합니다. 버전은 `build-app.sh`의 `CFBundleShortVersionString`을 따릅니다.
+같은 이름의 DMG가 이미 있으면 덮어쓰지 않고 멈추며, 덮어쓰려면 `--force`를 붙입니다.
+
 > `swift run`으로도 프로세스는 뜨지만, 번들 Info.plist가 없어
 > 일반 앱처럼 전면 활성화되지 않을 수 있습니다. 위 스크립트를 사용하세요.
 
