@@ -9,6 +9,7 @@ struct KornflakeApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 980, minHeight: 620)
+                .preferredColorScheme(.dark)
                 .onAppear {
                     model.installKeyMonitor()
                     if model.rootURL == nil {
