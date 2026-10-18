@@ -333,4 +333,26 @@ final class K2RobustnessTests: XCTestCase {
         let index = try K2MonolithIndex.read(url: url)
         XCTAssertTrue(index.extentsByName.isEmpty)
     }
+
+    func testInflateRoundTrip() throws {
+        let text = String(repeating: "<V name=\"lowKey\" value=\"36\"/>", count: 2_000)
+        let plain = Data(text.utf8)
+        var compressed = [UInt8](repeating: 0, count: plain.count + 1024)
+        let written = plain.withUnsafeBytes { src in
+            compression_encode_buffer(
+                &compressed, compressed.count,
+                src.bindMemory(to: UInt8.self).baseAddress!, plain.count,
+                nil, COMPRESSION_ZLIB
+            )
+        }
+        XCTAssertGreaterThan(written, 0)
+        // K2 stores a zlib stream: a 2-byte header in front of the raw DEFLATE data.
+        let stream = Data([0x78, 0x9C]) + Data(compressed.prefix(written)) + Data("trailing bytes".utf8)
+        XCTAssertEqual(try K2Compression.inflate(stream), plain)
+    }
+
+    func testInflateRejectsNonZlibData() {
+        XCTAssertThrowsError(try K2Compression.inflate(Data(repeating: 0x78, count: 4096)))
+        XCTAssertThrowsError(try K2Compression.inflate(Data([0x78, 0x9C, 0x00])))
+    }
 }

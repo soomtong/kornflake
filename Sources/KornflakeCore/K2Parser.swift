@@ -93,33 +93,54 @@ public enum K2Error: LocalizedError {
 enum K2Compression {
     /// K2 stores a normal zlib stream. Compression.framework's COMPRESSION_ZLIB
     /// consumes raw DEFLATE, so skip the 2-byte zlib header.
+    /// Decompression is streamed so the output size does not have to be guessed up front;
+    /// a candidate that is not a zlib stream fails on the first chunk without a large allocation.
     static func inflate(_ data: Data) throws -> Data {
         guard data.count > 6 else { throw K2Error.missingXML }
         let raw = data.dropFirst(2)
-        var capacity = max(4 << 20, raw.count * 8)
         let maximum = 32 << 20
+        let chunkSize = 256 << 10
 
-        while capacity <= maximum {
-            var output = [UInt8](repeating: 0, count: capacity)
-            let written: Int = output.withUnsafeMutableBytes { outPtr in
-                raw.withUnsafeBytes { inPtr in
-                    guard let outBase = outPtr.bindMemory(to: UInt8.self).baseAddress,
-                          let inBase = inPtr.bindMemory(to: UInt8.self).baseAddress else {
-                        return 0
-                    }
-                    return compression_decode_buffer(
-                        outBase, capacity,
-                        inBase, raw.count,
-                        nil, COMPRESSION_ZLIB
-                    )
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
+            throw K2Error.missingXML
+        }
+        defer { compression_stream_destroy(stream) }
+
+        var output = Data()
+        let chunk = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { chunk.deallocate() }
+
+        try raw.withUnsafeBytes { (inPtr: UnsafeRawBufferPointer) in
+            guard let inBase = inPtr.bindMemory(to: UInt8.self).baseAddress else {
+                throw K2Error.missingXML
+            }
+            stream.pointee.src_ptr = inBase
+            stream.pointee.src_size = raw.count
+            while true {
+                stream.pointee.dst_ptr = chunk
+                stream.pointee.dst_size = chunkSize
+                let status = compression_stream_process(stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                let produced = chunkSize - stream.pointee.dst_size
+                if produced > 0 {
+                    output.append(chunk, count: produced)
+                    guard output.count <= maximum else { throw K2Error.missingXML }
+                }
+                switch status {
+                case COMPRESSION_STATUS_OK:
+                    // The decoder also returns OK with no progress when the input is exhausted
+                    // but the stream is unterminated; treat that as the end of the data.
+                    if produced == 0 && stream.pointee.src_size == 0 { return }
+                case COMPRESSION_STATUS_END:
+                    return
+                default:
+                    throw K2Error.missingXML
                 }
             }
-            if written > 0 {
-                return Data(output.prefix(written))
-            }
-            capacity *= 2
         }
-        throw K2Error.missingXML
+        guard !output.isEmpty else { throw K2Error.missingXML }
+        return output
     }
 
     static func looksLikeZlibHeader(_ bytes: [UInt8], at index: Int) -> Bool {
@@ -383,6 +404,8 @@ public enum K2Parser {
             let length = min(4 << 20, fileSize - offset)
             try? handle.seek(toOffset: UInt64(offset))
             guard let data = try? handle.read(upToCount: length), !data.isEmpty else { continue }
+            // Only attempt to inflate when the first byte can be a zlib CMF byte.
+            guard data[data.startIndex] == 0x78 else { continue }
             if let xml = try? decodeXMLCandidate(data) { return xml }
         }
 
@@ -426,7 +449,6 @@ public enum K2Parser {
 
     private static func decodeXMLCandidate(_ data: Data) throws -> Data {
         let inflated = try K2Compression.inflate(data)
-        let bytes = [UInt8](inflated)
         let start: Int
         if let range = inflated.range(of: Data("<?xml".utf8)) {
             start = inflated.distance(from: inflated.startIndex, to: range.lowerBound)
@@ -441,7 +463,7 @@ public enum K2Parser {
             throw K2Error.missingXML
         }
         let end = inflated.distance(from: inflated.startIndex, to: endRange.upperBound)
-        guard start < end, end <= bytes.count else { throw K2Error.missingXML }
+        guard start < end, end <= inflated.count else { throw K2Error.missingXML }
         return inflated.subdata(in: start..<end)
     }
 
@@ -450,6 +472,9 @@ public enum K2Parser {
         let parser = XMLParser(data: data)
         parser.delegate = builder
         parser.shouldProcessNamespaces = false
+        // The mapping comes from an untrusted file; never fetch or expand external entities.
+        parser.shouldResolveExternalEntities = false
+        parser.externalEntityResolvingPolicy = .never
         guard parser.parse(), let root = builder.root else {
             throw K2Error.corruptXML(builder.parseError ?? "XML parser failed")
         }
