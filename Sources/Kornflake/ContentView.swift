@@ -217,16 +217,40 @@ struct ContentView: View {
         }
     }
 
+    /// The C4 button doubles as a now-playing readout: while playing it shows the sounding notes,
+    /// each tinted by its pitch class.
+    private var testToneLabel: Text {
+        let names = model.currentNoteNames
+        guard model.isPlaying, !names.isEmpty else { return Text("C4") }
+        var label = names.prefix(3).enumerated().reduce(Text("")) { text, item in
+            text + Text(item.offset == 0 ? item.element : " " + item.element)
+                .foregroundColor(pitchClassColor(item.element))
+        }
+        if names.count > 3 {
+            label = label + Text(" +\(names.count - 3)").foregroundColor(Theme.textDim)
+        }
+        return label
+    }
+
+    /// Hue around the circle by semitone, so the same pitch class always has the same colour.
+    private func pitchClassColor(_ name: String) -> Color {
+        let letter = String(name.prefix { !$0.isNumber && $0 != "-" })
+        let pitchClass = NoteNaming.sharpNames.firstIndex(of: letter) ?? 0
+        return Color(hue: Double(pitchClass) / 12, saturation: 0.55, brightness: 1)
+    }
+
     /// Play controls pinned next to the patch name so they stay in reach while tweaking the panels below.
     private var transport: some View {
         HStack(spacing: 8) {
             Button {
-                model.testTone()
+                if !model.isPlaying { model.testTone() }
             } label: {
-                Label(model.tr("C4", "C4"), systemImage: "speaker.wave.2.fill")
+                Label { testToneLabel } icon: { Image(systemName: "speaker.wave.2.fill") }
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(minWidth: 64)
             }
             .buttonStyle(DAWButtonStyle())
-            .disabled(model.isPlaying)
             .help(model.tr(
                 "Play C4 to audition the raw tone before building a scale or chord (⌘T)",
                 "스케일이나 코드를 만들기 전에 C4 원음을 먼저 들어 봅니다 (⌘T)"
@@ -239,7 +263,9 @@ struct ContentView: View {
                 model.isPlaying ? model.stop() : model.play()
             } label: {
                 Label(
-                    model.isPlaying ? model.tr("Stop", "정지") : model.tr("Play", "재생"),
+                    model.isPreparing
+                        ? model.tr("Preparing…", "준비 중…")
+                        : model.isPlaying ? model.tr("Stop", "정지") : model.tr("Play", "재생"),
                     systemImage: model.isPlaying ? "stop.fill" : "play.fill"
                 )
                 .font(.system(size: 14, weight: .bold))
@@ -420,6 +446,18 @@ struct ContentView: View {
                     Param(model.tr("Duration", "길이")) {
                         LCDReadout(text: "\(Int(model.noteDuration * 1000)) ms", minWidth: 70)
                     }
+                    if model.sequential {
+                        Param(model.tr("Rate", "진행 간격")) {
+                            HStack(spacing: 8) {
+                                DAWSelect(
+                                    selection: $model.stepLength,
+                                    options: NoteLength.allCases.map { (value: $0, label: $0.rawValue) },
+                                    width: 110
+                                )
+                                LCDReadout(text: "\(Int(model.stepDuration * 1000)) ms", minWidth: 70)
+                            }
+                        }
+                    }
                     Spacer()
                     Param(model.tr("Tempo", "템포")) {
                         DAWStepper(
@@ -450,7 +488,7 @@ struct ContentView: View {
             LED(isOn: model.isPlaying, color: Theme.ledGreen)
         } content: {
             VStack(alignment: .leading, spacing: 10) {
-                let notes = model.isPlaying ? model.currentNoteNames : model.plannedPlan.names
+                let notes = model.plannedPlan.names
                 if notes.isEmpty {
                     Text(model.tr("No notes", "음 없음"))
                         .foregroundStyle(Theme.textDim)

@@ -40,13 +40,15 @@ final class AppModel: ObservableObject {
     @Published var chord: ChordType = ChordType.all[0]
     @Published var sequential = true
     @Published var descending = false
-    @Published var twoOctaves = false
+    @Published var twoOctaves = true
     /// Scale goes up and back down (or down and back up with descending) in one pass.
-    @Published var upDown = false
+    @Published var upDown = true
     @Published var extendUp = 0
     @Published var extendDown = 0
     @Published var loop = false
     @Published var noteLength: NoteLength = .quarter
+    /// Time from one note's start to the next in sequential mode, separate from how long each note sounds.
+    @Published var stepLength: NoteLength = .quarter
     @Published var tempo: Double = 120
     @Published var pedalHold = false
     /// Restart playback when a control changes while playing, so the new setting is heard at once.
@@ -74,6 +76,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var currentNoteNames: [String] = []
     @Published private(set) var playbackMessage = ""
+    /// Playback has started but the first note has not sounded yet (samples are still loading).
+    @Published private(set) var isPreparing = false
 
     private enum ScanStatus {
         case idle
@@ -125,6 +129,7 @@ final class AppModel: ObservableObject {
             $extendUp.map { _ in }.eraseToAnyPublisher(),
             $extendDown.map { _ in }.eraseToAnyPublisher(),
             $noteLength.map { _ in }.eraseToAnyPublisher(),
+            $stepLength.map { _ in }.eraseToAnyPublisher(),
             $tempo.map { _ in }.eraseToAnyPublisher(),
             $pedalHold.map { _ in }.eraseToAnyPublisher(),
             $loop.map { _ in }.eraseToAnyPublisher(),
@@ -329,6 +334,10 @@ final class AppModel: ObservableObject {
         noteLength.seconds(at: tempo)
     }
 
+    var stepDuration: TimeInterval {
+        stepLength.seconds(at: tempo)
+    }
+
     var plannedPlan: AuditionPlan {
         AuditionBuilder.makePlan(
             mode: mode,
@@ -517,6 +526,7 @@ final class AppModel: ObservableObject {
         let groupIndex = selectedGroupIndex
         let (root, library) = resolverLocation
         let length = noteDuration
+        let step = stepDuration
         let shouldLoop = loop
         let together = !sequential
         let hold = pedalHold
@@ -531,7 +541,7 @@ final class AppModel: ObservableObject {
         if hold, let target { midi.sustain(true, target: target) }
         isPlaying = true
         currentNoteNames = []
-        playbackMessage = tr("Preparing samples…", "샘플을 준비하는 중…")
+        isPreparing = true
 
         playbackQueue.async { [weak self] in
             guard let self else { return }
@@ -542,6 +552,7 @@ final class AppModel: ObservableObject {
                 rootURL: root,
                 libraryName: library,
                 noteLength: length,
+                stepInterval: step,
                 loop: shouldLoop,
                 together: together,
                 hold: hold,
@@ -598,6 +609,7 @@ final class AppModel: ObservableObject {
         isPlaying = false
         currentNoteNames = []
         playbackMessage = ""
+        isPreparing = false
     }
 
     func testTone() {
@@ -657,6 +669,7 @@ final class AppModel: ObservableObject {
         rootURL: URL,
         libraryName: String,
         noteLength: Double,
+        stepInterval: Double,
         loop: Bool,
         together: Bool,
         hold: Bool,
@@ -722,7 +735,7 @@ final class AppModel: ObservableObject {
                         generation: generation
                     )
                     updateCurrentNotes([plan.names[index]], generation: generation)
-                    sleepInterruptibly(noteLength, generation: generation)
+                    sleepInterruptibly(stepInterval, generation: generation)
                 }
                 sleepInterruptibly(0.1, generation: generation)
                 if hold && !loop {
@@ -895,6 +908,7 @@ final class AppModel: ObservableObject {
             guard current == generation else { return }
             self.currentNoteNames = names
             self.playbackMessage = ""
+            self.isPreparing = false
         }
     }
 
@@ -909,6 +923,7 @@ final class AppModel: ObservableObject {
             self.isPlaying = false
             self.currentNoteNames = []
             self.playbackMessage = ""
+            self.isPreparing = false
         }
     }
 
