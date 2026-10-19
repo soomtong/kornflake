@@ -1,0 +1,235 @@
+name: Release
+
+# The arm64 DMG is built and verified locally, then attached to a GitHub release by hand.
+# This workflow fills in what the release is missing and publishes the Homebrew cask:
+#   1. plan: read the release assets and find which architectures have no DMG yet.
+#   2. build: build each missing DMG on a macOS runner (x86_64 is cross-built) and upload it.
+#   3. tap: write Casks/kornflake.rb in the tap repository from the release's DMGs.
+# It runs when a release is published, or by hand for an existing tag (Actions → Release → Run workflow).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to complete (e.g. v0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_REPO: ${{ github.repository }}
+  TAP_REPO: soomtong/homebrew-tap
+  TAP_BRANCH: main
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      missing: ${{ steps.plan.outputs.missing }}
+      arm64_asset: ${{ steps.plan.outputs.arm64_asset }}
+      x86_64_asset: ${{ steps.plan.outputs.x86_64_asset }}
+      publish_tap: ${{ steps.plan.outputs.publish_tap }}
+    steps:
+      - name: Find missing DMGs
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag '$TAG' is not of the form v<major>.<minor>.<patch>" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+
+          release="$(gh release view "$TAG" --json isDraft,isPrerelease,assets)"
+          names="$(jq -r '.assets[].name' <<<"$release")"
+          has() { grep -Fxq "$1" <<<"$names"; }
+
+          # Releases up to v0.3.0 carry an unsuffixed arm64 DMG (Kornflake-<version>.dmg).
+          missing=()
+          if has "Kornflake-$VERSION-arm64.dmg"; then
+            arm64="Kornflake-$VERSION-arm64.dmg"
+          elif has "Kornflake-$VERSION.dmg"; then
+            arm64="Kornflake-$VERSION.dmg"
+          else
+            arm64="Kornflake-$VERSION-arm64.dmg"
+            missing+=(arm64)
+          fi
+          x86_64="Kornflake-$VERSION-x86_64.dmg"
+          has "$x86_64" || missing+=(x86_64)
+
+          if [ "$(jq -r '.isDraft or .isPrerelease' <<<"$release")" = "true" ]; then
+            publish_tap=false
+          else
+            publish_tap=true
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "missing=$(jq -cn '$ARGS.positional' --args ${missing[@]+"${missing[@]}"})"
+            echo "arm64_asset=$arm64"
+            echo "x86_64_asset=$x86_64"
+            echo "publish_tap=$publish_tap"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.missing != '[]'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.plan.outputs.missing) }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Use current build scripts for older tags
+        run: |
+          set -euo pipefail
+          # Tags made before --arch existed get the scripts from this workflow's commit.
+          # The app sources stay at the tag; the version check below still applies.
+          if ! grep -q -- '--arch' scripts/build-dist.sh 2>/dev/null; then
+            git fetch --depth=1 origin "$GITHUB_SHA"
+            git checkout "$GITHUB_SHA" -- scripts/build-app.sh scripts/build-dist.sh
+            echo "Using build scripts from $GITHUB_SHA"
+          fi
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Build DMG
+        run: ./scripts/build-dist.sh --arch "$ARCH"
+
+      - name: Check version
+        run: |
+          set -euo pipefail
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Kornflake.app/Contents/Info.plist)"
+          if [ "$PLIST_VERSION" != "$VERSION" ]; then
+            echo "Info.plist version $PLIST_VERSION does not match tag $TAG" >&2
+            exit 1
+          fi
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "dist/Kornflake-$VERSION-$ARCH.dmg"
+
+  tap:
+    name: Update Homebrew cask
+    needs: [plan, build]
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      needs.plan.outputs.publish_tap == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      ARM64_ASSET: ${{ needs.plan.outputs.arm64_asset }}
+      X86_64_ASSET: ${{ needs.plan.outputs.x86_64_asset }}
+    steps:
+      - name: Download DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir dist --pattern "$ARM64_ASSET" --pattern "$X86_64_ASSET"
+          ls -la dist
+
+      - name: Write cask
+        run: |
+          set -euo pipefail
+          ARM64_SHA="$(sha256sum "dist/$ARM64_ASSET" | cut -d' ' -f1)"
+          X86_64_SHA="$(sha256sum "dist/$X86_64_ASSET" | cut -d' ' -f1)"
+          BASE_URL="https://github.com/$GH_REPO/releases/download/$TAG"
+
+          cat > kornflake.rb <<CASK
+          cask "kornflake" do
+            version "$VERSION"
+
+            on_arm do
+              sha256 "$ARM64_SHA"
+              url "$BASE_URL/$ARM64_ASSET"
+            end
+            on_intel do
+              sha256 "$X86_64_SHA"
+              url "$BASE_URL/$X86_64_ASSET"
+            end
+
+            name "Kornflake"
+            desc "Preview Yamaha Motif ES Kontakt samples without Kontakt Player"
+            homepage "https://github.com/$GH_REPO"
+
+            livecheck do
+              url :homepage
+              strategy :github_latest
+            end
+
+            depends_on macos: ">= :sonoma"
+
+            app "Kornflake.app"
+
+            zap trash: [
+              "~/Library/Caches/Kornflake",
+              "~/Library/Preferences/com.kornflake.preview.plist",
+            ]
+
+            caveats <<~EOS
+              Kornflake is ad-hoc signed and not notarized, so Gatekeeper blocks the first launch.
+              Allow it in System Settings → Privacy & Security → "Open Anyway", or run:
+                xattr -dr com.apple.quarantine "#{appdir}/Kornflake.app"
+            EOS
+          end
+          CASK
+
+          ruby -c kornflake.rb
+          cat kornflake.rb
+
+      - name: Push to tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "The HOMEBREW_TAP_TOKEN secret is required to push to $TAP_REPO" >&2
+            exit 1
+          fi
+
+          git clone --depth=1 --branch "$TAP_BRANCH" \
+            "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
+          mkdir -p tap-repo/Casks
+          cp kornflake.rb tap-repo/Casks/kornflake.rb
+
+          cd tap-repo
+          git config user.name "soomtong"
+          git config user.email "soomtong@users.noreply.github.com"
+          git add Casks/kornflake.rb
+          if git diff --cached --quiet; then
+            echo "Tap already up to date."
+            exit 0
+          fi
+          git commit -m "Update kornflake to $TAG"
+          git push origin "$TAP_BRANCH"

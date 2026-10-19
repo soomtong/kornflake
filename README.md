@@ -94,9 +94,33 @@ cd /Users/dp/Repository/kornflake
 open Kornflake.app
 ```
 
-배포용 DMG는 `./scripts/build-dist.sh`로 만듭니다. 앱을 빌드한 뒤 `dist/Kornflake-<버전>.dmg`를 만들고
+배포용 DMG는 `./scripts/build-dist.sh`로 만듭니다. 앱을 빌드한 뒤 `dist/Kornflake-<버전>-<아키텍처>.dmg`를 만들고
 SHA-256을 출력합니다. 버전은 `build-app.sh`의 `CFBundleShortVersionString`을 따릅니다.
 같은 이름의 DMG가 이미 있으면 덮어쓰지 않고 멈추며, 덮어쓰려면 `--force`를 붙입니다.
+아키텍처는 현재 Mac을 따르고, `--arch x86_64`(또는 `arm64`)로 다른 아키텍처를 크로스 빌드할 수 있습니다.
+
+Homebrew로 설치하려면:
+
+```bash
+brew install --cask soomtong/tap/kornflake
+```
+
+### 릴리즈와 Homebrew 배포
+
+빌드와 릴리즈는 로컬에서 직접 하고, 나머지는 `.github/workflows/release.yml`이 채웁니다.
+
+1. 로컬에서 `./scripts/build-dist.sh`로 `Kornflake-<버전>-arm64.dmg`를 만들고 검증합니다.
+2. 태그 `v<버전>`으로 GitHub 릴리즈를 만들면서 DMG를 첨부해 게시합니다.
+   예: `gh release create v0.4.0 dist/Kornflake-0.4.0-arm64.dmg`
+3. 게시되면 워크플로가 릴리즈에 없는 아키텍처의 DMG(보통 `x86_64`)를 macOS 러너에서 빌드해 첨부하고,
+   [soomtong/homebrew-tap](https://github.com/soomtong/homebrew-tap)의 `Casks/kornflake.rb`를 갱신합니다.
+
+- 이미 있는 DMG는 다시 빌드하거나 덮어쓰지 않습니다. DMG 없이 게시하면 두 아키텍처를 모두 CI에서 빌드합니다.
+- 태그의 `Info.plist` 버전이 태그와 다르면 빌드가 실패합니다.
+- 기존 릴리즈를 채우려면 Actions → Release → Run workflow에 태그를 넣거나
+  `gh workflow run release.yml -f tag=v0.3.0`을 실행합니다. 접미사 없는 `Kornflake-<버전>.dmg`(v0.3.0 이전 이름)는 arm64로 봅니다.
+- pre-release는 DMG만 채우고 Homebrew tap은 갱신하지 않습니다.
+- 저장소 secret `HOMEBREW_TAP_TOKEN`이 필요합니다. `soomtong/homebrew-tap`에 Contents 쓰기 권한이 있는 토큰입니다.
 
 > `swift run`으로도 프로세스는 뜨지만, 번들 Info.plist가 없어
 > 일반 앱처럼 전면 활성화되지 않을 수 있습니다. 위 스크립트를 사용하세요.
