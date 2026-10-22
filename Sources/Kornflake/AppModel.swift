@@ -50,7 +50,9 @@ final class AppModel: ObservableObject {
     /// Time from one note's start to the next in sequential mode, separate from how long each note sounds.
     @Published var stepLength: NoteLength = .quarter
     @Published var tempo: Double = 120
-    @Published var pedalHold = false
+    /// Pedal latched on (⌥P). Tab holds the pedal only while pressed (`pedalHeld`).
+    @Published var pedalHold = false { didSet { pedalChanged() } }
+    @Published private(set) var pedalHeld = false { didSet { pedalChanged() } }
     /// Sequential notes ring into the next one instead of stopping at the note length.
     @Published var legato = false
     /// Restart playback when a control changes while playing, so the new setting is heard at once.
@@ -98,6 +100,7 @@ final class AppModel: ObservableObject {
 
     private let midi = MIDIOutput()
     private var keyMonitor: Any?
+    private var resignObserver: Any?
     private var autoPlaybackCancellable: AnyCancellable?
     private var playWhenParsed = false
     private var isTestTone = false
@@ -109,6 +112,8 @@ final class AppModel: ObservableObject {
     /// wakes a sleeping sequence immediately instead of at the next poll.
     private let stateLock = NSCondition()
     private var playbackGeneration: UInt64 = 0
+    /// `isPedalDown` for the playback queue, which reads it note by note. Guarded by `stateLock`.
+    private var pedalDownForPlayback = false
     private var parseGeneration: UInt64 = 0
 
     private static func stored<T>(_ key: String, _ fallback: T) -> T {
@@ -137,7 +142,6 @@ final class AppModel: ObservableObject {
             $noteLength.map { _ in }.eraseToAnyPublisher(),
             $stepLength.map { _ in }.eraseToAnyPublisher(),
             $tempo.map { _ in }.eraseToAnyPublisher(),
-            $pedalHold.map { _ in }.eraseToAnyPublisher(),
             $legato.map { _ in }.eraseToAnyPublisher(),
             $loop.map { _ in }.eraseToAnyPublisher(),
             $selectedGroupIndex.map { _ in }.eraseToAnyPublisher(),
@@ -346,6 +350,11 @@ final class AppModel: ObservableObject {
     }
 
     /// Legato only applies to sequential playback; together, every note already overlaps.
+    /// The pedal applies live: notes started while it is down ring to their natural decay.
+    var isPedalDown: Bool {
+        pedalHold || pedalHeld
+    }
+
     var isLegatoActive: Bool {
         legato && sequential
     }
@@ -547,14 +556,14 @@ final class AppModel: ObservableObject {
         let shouldLoop = loop
         let together = !sequential
         // Legato decides where each note ends, so it overrides the pedal.
-        let hold = pedalHold && !isLegatoActive
+        let allowPedal = !isLegatoActive
         let fadeOut = isLegatoActive ? Legato.overlap : PreviewPlayer.defaultFadeOut
         let target = activeMIDITarget
         let useInternal = internalSound || target == nil
 
         let generation = advancePlaybackGeneration()
 
-        if hold, let target { midi.sustain(true, target: target) }
+        if allowPedal, isPedalDown, let target { midi.sustain(true, target: target) }
         isPlaying = true
         currentNoteNames = []
         isPreparing = true
@@ -571,7 +580,7 @@ final class AppModel: ObservableObject {
                 stepInterval: step,
                 loop: shouldLoop,
                 together: together,
-                hold: hold,
+                allowPedal: allowPedal,
                 fadeOut: fadeOut,
                 midiTarget: target,
                 useInternal: useInternal,
@@ -585,11 +594,15 @@ final class AppModel: ObservableObject {
     ///   it. Text input still receives the key, so searching for "Full Grand" keeps working.
     /// - Arrow keys: ⌘ and ⌥⌘ with an arrow mirror the H/J/K/L menu shortcuts, so both
     ///   styles work. The menu can only show one shortcut per item.
+    /// - Tab: a sustain pedal held while the key is down. Menus only see key-down events.
     func installKeyMonitor() {
         guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self,
-                  !(event.window is NSPanel),
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self, !(event.window is NSPanel) else { return event }
+            if event.keyCode == 48 {
+                return self.handlePedalKey(event) ? nil : event
+            }
+            guard event.type == .keyDown,
                   !(event.window?.firstResponder is NSText && event.keyCode == 49)
             else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -610,6 +623,46 @@ final class AppModel: ObservableObject {
             }
             return nil
         }
+        // A key released while another app is active never sends key-up here.
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.pedalHeld = false
+        }
+    }
+
+    /// Tab presses the pedal. Text input keeps Tab for moving focus, but a release always
+    /// lifts the pedal so it cannot stick.
+    private func handlePedalKey(_ event: NSEvent) -> Bool {
+        if event.type == .keyUp {
+            guard pedalHeld else { return false }
+            pedalHeld = false
+            return true
+        }
+        guard event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+              !(event.window?.firstResponder is NSText)
+        else { return false }
+        if !event.isARepeat { pedalHeld = true }
+        return true
+    }
+
+    /// Hands the pedal to the playback queue and, while playing, moves the MIDI sustain with it.
+    private func pedalChanged() {
+        let down = isPedalDown
+        stateLock.lock()
+        let changed = pedalDownForPlayback != down
+        pedalDownForPlayback = down
+        stateLock.unlock()
+        guard changed, isPlaying, isTestTone || !isLegatoActive, let target = activeMIDITarget else { return }
+        midi.sustain(down, target: target)
+    }
+
+    private func pedalIsDownForPlayback() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return pedalDownForPlayback
     }
 
     func togglePlayback() {
@@ -648,7 +701,7 @@ final class AppModel: ObservableObject {
         isTestTone = true
         let (root, library) = resolverLocation
         let groupIndex = selectedGroupIndex
-        let holdForTest = pedalHold
+        let holdForTest = isPedalDown
         let target = activeMIDITarget
         let useInternal = internalSound || target == nil
         if holdForTest, let target { midi.sustain(true, target: target) }
@@ -688,7 +741,7 @@ final class AppModel: ObservableObject {
         stepInterval: Double,
         loop: Bool,
         together: Bool,
-        hold: Bool,
+        allowPedal: Bool,
         fadeOut: TimeInterval,
         midiTarget: MIDITarget?,
         useInternal: Bool,
@@ -712,6 +765,7 @@ final class AppModel: ObservableObject {
             if !isCurrent(generation) { return }
 
             if together {
+                let hold = allowPedal && pedalIsDownForPlayback()
                 let duration = max(0.1, noteLength)
                 let notes = prepared.compactMap { $0 }
                 playNotes(
@@ -731,9 +785,12 @@ final class AppModel: ObservableObject {
                 // starting one note never pushes the following notes later.
                 var slot = Date()
                 var lastNaturalDuration: TimeInterval = 0
+                var lastHold = false
                 for (index, midi) in plan.midiNotes.enumerated() {
                     sleepInterruptibly(until: slot, generation: generation)
                     if !isCurrent(generation) { return }
+                    let hold = allowPedal && pedalIsDownForPlayback()
+                    lastHold = hold
                     let notes = prepared[index].map { [$0] } ?? []
                     if let note = notes.first { lastNaturalDuration = note.naturalDuration }
                     playNotes(
@@ -755,7 +812,7 @@ final class AppModel: ObservableObject {
                 if !loop {
                     let lastStart = slot.addingTimeInterval(-stepInterval)
                     end = max(end, lastStart.addingTimeInterval(noteLength + 0.1))
-                    if hold {
+                    if lastHold {
                         end = max(end, lastStart.addingTimeInterval(min(12, max(1.0, lastNaturalDuration)) + 0.1))
                     }
                 }

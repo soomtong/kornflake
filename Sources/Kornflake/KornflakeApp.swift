@@ -148,7 +148,7 @@ struct KornflakeApp: App {
                     .keyboardShortcut("i", modifiers: [.option])
                 Button(model.tr("Auto Replay on Change", "변경 시 자동 재생")) { model.autoPlayback.toggle() }
                     .keyboardShortcut("a", modifiers: [.option])
-                Button(model.tr("Pedal Hold", "페달 홀드")) { model.pedalHold.toggle() }
+                Button(model.tr("Pedal Hold (Tab: while held)", "페달 홀드 (Tab: 누르는 동안)")) { model.pedalHold.toggle() }
                     .keyboardShortcut("p", modifiers: [.option])
                 Button(model.tr("Legato", "레가토")) { model.legato.toggle() }
                     .keyboardShortcut("g", modifiers: [.option])

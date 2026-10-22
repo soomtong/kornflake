@@ -40,7 +40,7 @@ struct ContentView: View {
                             .frame(width: 14)
                     }
                     .buttonStyle(DAWButtonStyle())
-                    .help(model.tr("Choose the Kontakt instrument folder to load", "불러올 Kontakt 악기 폴더 선택"))
+                    .help(model.tr("Choose the Kontakt instrument folder to load (⇧⌘O)", "불러올 Kontakt 악기 폴더 선택 (⇧⌘O)"))
 
                     Button {
                         model.scan()
@@ -125,6 +125,10 @@ struct ContentView: View {
                 .textFieldStyle(DAWSearchFieldStyle())
                 .padding(10)
                 .focused($searchFocused)
+                .help(model.tr(
+                    "Search patches (⌘F). Next / previous patch: ⌘J / ⌘K, category: ⌥⌘J / ⌥⌘K",
+                    "패치 검색 (⌘F). 다음 / 이전 패치: ⌘J / ⌘K, 카테고리: ⌥⌘J / ⌥⌘K"
+                ))
                 .onSubmit {
                     model.selectFirstVisiblePatch()
                     searchFocused = false
@@ -272,7 +276,7 @@ struct ContentView: View {
                 .frame(minWidth: 88, minHeight: 28)
             }
             .buttonStyle(DAWButtonStyle(kind: model.isPlaying ? .stop : .primary))
-            .help(model.tr("Play / Stop (Space)", "재생 / 정지 (Space)"))
+            .help(model.tr("Play / Stop (Space). Stop: ⌘.", "재생 / 정지 (Space). 정지: ⌘."))
         }
         .fixedSize()
     }
@@ -313,8 +317,8 @@ struct ContentView: View {
                 }
                 .padding(.top, 4)
                 .help(model.tr(
-                    "A patch is built from layers (Kontakt groups), usually velocity layers. Auto picks the best match per note; choosing one plays only that layer.",
-                    "패치는 레이어(Kontakt 그룹)로 구성되며 대개 벨로시티 레이어입니다. 자동은 음마다 가장 알맞은 레이어를 고르고, 하나를 선택하면 그 레이어만 재생합니다."
+                    "A patch is built from layers (Kontakt groups), usually velocity layers. Auto picks the best match per note; choosing one plays only that layer. (⌥⌘] / ⌥⌘[)",
+                    "패치는 레이어(Kontakt 그룹)로 구성되며 대개 벨로시티 레이어입니다. 자동은 음마다 가장 알맞은 레이어를 고르고, 하나를 선택하면 그 레이어만 재생합니다. (⌥⌘] / ⌥⌘[)"
                 ))
             }
         }
@@ -354,6 +358,7 @@ struct ContentView: View {
     private var midiPanel: some View {
         DAWPanel(model.tr("MIDI control", "MIDI 컨트롤")) {
             DAWToggle(title: model.tr("MIDI Out", "MIDI 출력"), isOn: $model.midiEnabled)
+                .help(model.tr("Send played notes to MIDI (⌥M)", "재생하는 음을 MIDI로 출력 (⌥M)"))
         } content: {
             midiControl
         }
@@ -366,6 +371,7 @@ struct ContentView: View {
                     selection: $model.mode,
                     options: AuditionMode.allCases.map { (value: $0, label: model.modeName($0)) }
                 )
+                .help(model.tr("Scale mode (⌘1) / Chord mode (⌘2)", "스케일 모드 (⌘1) / 코드 모드 (⌘2)"))
 
                 HStack(alignment: .top, spacing: 12) {
                     Param(model.tr("Root", "근음")) {
@@ -375,6 +381,7 @@ struct ContentView: View {
                             width: 84
                         )
                     }
+                    .help(model.tr("Root up / down (⌘L / ⌘H, ⌘→ / ⌘←)", "근음 올리기 / 내리기 (⌘L / ⌘H, ⌘→ / ⌘←)"))
                     Param(model.tr("Octave", "옥타브")) {
                         DAWSelect(
                             selection: $model.octave,
@@ -382,6 +389,7 @@ struct ContentView: View {
                             width: 72
                         )
                     }
+                    .help(model.tr("Octave up / down (⌥⌘L / ⌥⌘H, ⌥⌘→ / ⌥⌘←)", "옥타브 올리기 / 내리기 (⌥⌘L / ⌥⌘H, ⌥⌘→ / ⌥⌘←)"))
                     if model.mode == .scale {
                         Param(model.tr("Scale", "스케일")) {
                             DAWSelect(
@@ -389,6 +397,7 @@ struct ContentView: View {
                                 options: ScaleType.all.map { (value: $0, label: model.scaleName($0)) }
                             )
                         }
+                        .help(model.tr("Next / previous scale (⌘] / ⌘[)", "다음 / 이전 스케일 (⌘] / ⌘[)"))
                     } else {
                         Param(model.tr("Chord", "코드")) {
                             DAWSelect(
@@ -396,17 +405,20 @@ struct ContentView: View {
                                 options: ChordType.all.map { (value: $0, label: model.chordName($0)) }
                             )
                         }
+                        .help(model.tr("Next / previous chord (⌘] / ⌘[)", "다음 / 이전 코드 (⌘] / ⌘[)"))
                     }
                 }
 
                 if model.mode == .scale {
                     FlowLayout(spacing: 8) {
                         DAWToggle(title: model.tr("Descending", "내림차순"), isOn: $model.descending)
+                            .help(model.tr("Play from the top down (⌘D)", "위에서 아래로 재생 (⌘D)"))
                         DAWToggle(title: model.tr("Two octaves", "2옥타브"), isOn: $model.twoOctaves)
+                            .help(model.tr("Play the scale over two octaves (⌥⌘D)", "스케일을 2옥타브로 재생 (⌥⌘D)"))
                         DAWToggle(title: model.tr("Up & down", "오르내리기"), isOn: $model.upDown)
                             .help(model.tr(
-                                "Play the scale up and back down in one pass. With Descending it goes down first. With Loop it repeats seamlessly.",
-                                "스케일을 올라갔다가 다시 내려오는 한 사이클로 재생합니다. 내림차순과 함께 쓰면 내려가는 것부터 시작하고, 반복을 켜면 끊김 없이 이어집니다."
+                                "Play the scale up and back down in one pass. With Descending it goes down first. With Loop it repeats seamlessly. (⇧⌘D)",
+                                "스케일을 올라갔다가 다시 내려오는 한 사이클로 재생합니다. 내림차순과 함께 쓰면 내려가는 것부터 시작하고, 반복을 켜면 끊김 없이 이어집니다. (⇧⌘D)"
                             ))
                     }
                 } else {
@@ -419,8 +431,8 @@ struct ContentView: View {
                         }
                     }
                     .help(model.tr(
-                        "Adds notes above or below the chord by continuing its pattern, for a fuller, wider voicing.",
-                        "코드의 패턴을 이어서 위나 아래에 음을 추가해 더 넓고 풍성한 사운드를 만듭니다."
+                        "Adds notes above or below the chord by continuing its pattern, for a fuller, wider voicing. Up: ⌘U / ⇧⌘U, down: ⌘B / ⇧⌘B",
+                        "코드의 패턴을 이어서 위나 아래에 음을 추가해 더 넓고 풍성한 사운드를 만듭니다. 위: ⌘U / ⇧⌘U, 아래: ⌘B / ⇧⌘B"
                     ))
                 }
             }
@@ -434,6 +446,7 @@ struct ContentView: View {
                     selection: $model.sequential,
                     options: [(value: true, label: model.tr("Sequential", "순차")), (value: false, label: model.tr("Together", "동시"))]
                 )
+                .help(model.tr("Switch between sequential and together (⌘3)", "순차 / 동시 전환 (⌘3)"))
 
                 HStack(alignment: .top, spacing: 12) {
                     Param(model.tr("Note length", "음 길이")) {
@@ -444,6 +457,7 @@ struct ContentView: View {
                         )
                         .disabled(model.isLegatoActive)
                     }
+                    .help(model.tr("Longer / shorter note (⌘= / ⌘-)", "음 길게 / 짧게 (⌘= / ⌘-)"))
                     Param(model.tr("Duration", "길이")) {
                         LCDReadout(text: "\(Int(model.playedNoteDuration * 1000)) ms", minWidth: 70)
                     }
@@ -469,22 +483,30 @@ struct ContentView: View {
                             minWidth: 80
                         )
                     }
+                    .help(model.tr("Faster / slower tempo (⌥⌘= / ⌥⌘-)", "템포 빠르게 / 느리게 (⌥⌘= / ⌥⌘-)"))
                 }
 
                 FlowLayout(spacing: 8) {
                     DAWToggle(title: model.tr("Legato", "레가토"), isOn: $model.legato)
                         .disabled(!model.sequential)
                         .help(model.tr(
-                            "Sequential only. Each note rings into the next and crossfades with it, ignoring Note length and Pedal hold.",
-                            "순차 재생 전용입니다. 각 음이 다음 음까지 이어져 겹치며 넘어갑니다. 음 길이와 페달 홀드는 무시합니다."
+                            "Sequential only. Each note rings into the next and crossfades with it, ignoring Note length and Pedal hold. (⌥G)",
+                            "순차 재생 전용입니다. 각 음이 다음 음까지 이어져 겹치며 넘어갑니다. 음 길이와 페달 홀드는 무시합니다. (⌥G)"
                         ))
-                    DAWToggle(title: model.tr("Pedal hold (natural decay)", "페달 홀드 (자연 감쇠)"), isOn: $model.pedalHold)
+                    // Lit while Tab is held as well, so the key gives visible feedback.
+                    DAWToggle(
+                        title: model.tr("Pedal hold (natural decay)", "페달 홀드 (자연 감쇠)"),
+                        isOn: Binding(get: { model.isPedalDown }, set: { model.pedalHold = $0 })
+                    )
                         .disabled(model.isLegatoActive)
-                        .help(model.tr("Let each note ring until the sample's own decay instead of cutting it at the note length.", "음 길이에서 자르지 않고 샘플 고유의 감쇠가 끝날 때까지 울리게 합니다."))
+                        .help(model.tr(
+                            "Let each note ring until the sample's own decay instead of cutting it at the note length. Hold Tab to press the pedal, ⌥P to latch it.",
+                            "음 길이에서 자르지 않고 샘플 고유의 감쇠가 끝날 때까지 울리게 합니다. Tab 을 누르는 동안 페달을 밟고, ⌥P 로 고정합니다."
+                        ))
                     DAWToggle(title: model.tr("Auto replay on change", "변경 시 자동 재생"), isOn: $model.autoPlayback)
                         .help(model.tr(
-                            "While playing, changing a control (chord, pattern, tempo, patch…) restarts playback so you hear it right away.",
-                            "재생 중에 코드, 패턴, 템포, 패치 등을 바꾸면 곧바로 다시 시작해 바뀐 소리를 바로 들려줍니다."
+                            "While playing, changing a control (chord, pattern, tempo, patch…) restarts playback so you hear it right away. (⌥A)",
+                            "재생 중에 코드, 패턴, 템포, 패치 등을 바꾸면 곧바로 다시 시작해 바뀐 소리를 바로 들려줍니다. (⌥A)"
                         ))
                 }
             }
@@ -543,8 +565,8 @@ struct ContentView: View {
 
                 DAWToggle(title: model.tr("Also play built-in sound", "내장 음색도 함께 재생"), isOn: $model.internalSound)
                     .help(model.tr(
-                        "Keep the built-in samples sounding together with MIDI out. Turn off to hear only the external instrument.",
-                        "MIDI 출력과 동시에 내장 샘플도 재생합니다. 끄면 외부 악기 소리만 들립니다."
+                        "Keep the built-in samples sounding together with MIDI out. Turn off to hear only the external instrument. (⌥I)",
+                        "MIDI 출력과 동시에 내장 샘플도 재생합니다. 끄면 외부 악기 소리만 들립니다. (⌥I)"
                     ))
             }
             .disabled(!model.midiEnabled)
@@ -579,6 +601,7 @@ struct ContentView: View {
                         Label(model.tr("Choose Instrument Folder…", "악기 폴더 선택…"), systemImage: "folder")
                     }
                     .buttonStyle(DAWButtonStyle(kind: .primary))
+                    .help(model.tr("Choose Instrument Folder (⇧⌘O)", "악기 폴더 선택 (⇧⌘O)"))
                 } else {
                     HStack(spacing: 18) {
                         StatPill(title: model.tr("Categories", "카테고리"), value: "\(model.categories.count)")
