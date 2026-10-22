@@ -470,6 +470,11 @@ struct ContentView: View {
                                     width: 110
                                 )
                                 LCDReadout(text: "\(Int(model.stepDuration * 1000)) ms", minWidth: 70)
+                                DAWToggle(title: model.tr("Link", "연동"), isOn: $model.linkStepToNote)
+                                    .help(model.tr(
+                                        "Change rate together with note length. Turn off to set them separately.",
+                                        "음 길이를 바꾸면 진행 간격도 함께 바뀝니다. 끄면 따로 정할 수 있습니다."
+                                    ))
                             }
                         }
                     }

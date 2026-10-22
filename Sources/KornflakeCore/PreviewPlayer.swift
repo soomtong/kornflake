@@ -11,6 +11,9 @@ public final class PreviewPlayer: @unchecked Sendable {
         let mixer = AVAudioMixerNode()
         var generation: UInt64 = 0
         var busyUntil = Date.distantPast
+        /// Ringing past its note length because the pedal was down when it started.
+        var held = false
+        var noteEnd = Date.distantPast
     }
 
     private let engine = AVAudioEngine()
@@ -99,6 +102,8 @@ public final class PreviewPlayer: @unchecked Sendable {
         voice.player.scheduleBuffer(noteBuffer, at: nil, options: [], completionHandler: nil)
         voice.player.play()
         voice.busyUntil = Date().addingTimeInterval(playbackDuration + 0.1)
+        voice.held = hold
+        voice.noteEnd = Date().addingTimeInterval(duration)
         lock.unlock()
 
         let stopAt = playbackDuration + 0.03
@@ -112,12 +117,52 @@ public final class PreviewPlayer: @unchecked Sendable {
         }
     }
 
+    /// Lifts the pedal. A held note fades out now if its note length has passed, otherwise
+    /// when it does, like a key that is still down when the pedal comes up.
+    public func releaseHeld(fadeOut: TimeInterval = PreviewPlayer.pedalReleaseFade) {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        for voice in voices where voice.held && voice.busyUntil > now {
+            voice.held = false
+            let delay = max(0, voice.noteEnd.timeIntervalSince(now))
+            voice.busyUntil = min(voice.busyUntil, now.addingTimeInterval(delay + fadeOut + 0.05))
+            let generation = voice.generation
+            timing.asyncAfter(deadline: .now() + delay) { [weak self, weak voice] in
+                guard let self, let voice else { return }
+                self.fade(voice, generation: generation, over: fadeOut)
+            }
+        }
+    }
+
+    /// Fade applied to a held note when the pedal comes up.
+    public static let pedalReleaseFade: TimeInterval = 0.08
+
+    /// Ramps the voice down in small steps, then stops it. A newer note on the voice cancels it.
+    private func fade(_ voice: Voice, generation: UInt64, over seconds: TimeInterval) {
+        let steps = 16
+        for step in 1...steps {
+            timing.asyncAfter(deadline: .now() + seconds * Double(step) / Double(steps)) { [weak self, weak voice] in
+                guard let self, let voice else { return }
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard voice.generation == generation else { return }
+                if step == steps {
+                    voice.player.stop()
+                } else {
+                    voice.player.volume = 1 - Float(step) / Float(steps)
+                }
+            }
+        }
+    }
+
     public func stopAll() {
         lock.lock()
         for voice in voices {
             voice.generation &+= 1
             voice.player.stop()
             voice.busyUntil = .distantPast
+            voice.held = false
         }
         lock.unlock()
     }

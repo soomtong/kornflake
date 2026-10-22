@@ -46,9 +46,17 @@ final class AppModel: ObservableObject {
     @Published var extendUp = 0
     @Published var extendDown = 0
     @Published var loop = false
-    @Published var noteLength: NoteLength = .quarter
+    @Published var noteLength: NoteLength = .quarter {
+        didSet { if linkStepToNote, stepLength != noteLength { stepLength = noteLength } }
+    }
     /// Time from one note's start to the next in sequential mode, separate from how long each note sounds.
-    @Published var stepLength: NoteLength = .quarter
+    @Published var stepLength: NoteLength = .quarter {
+        didSet { if linkStepToNote, noteLength != stepLength { noteLength = stepLength } }
+    }
+    /// Note length and rate move together, so changing either keeps notes back to back.
+    @Published var linkStepToNote = true {
+        didSet { if linkStepToNote { stepLength = noteLength } }
+    }
     @Published var tempo: Double = 120
     /// Pedal latched on (⌥P). Tab holds the pedal only while pressed (`pedalHeld`).
     @Published var pedalHold = false { didSet { pedalChanged() } }
@@ -654,7 +662,10 @@ final class AppModel: ObservableObject {
         stateLock.lock()
         let changed = pedalDownForPlayback != down
         pedalDownForPlayback = down
+        // Wakes a sequence that waits for held notes to ring out.
+        stateLock.broadcast()
         stateLock.unlock()
+        if changed, !down { player.releaseHeld() }
         guard changed, isPlaying, isTestTone || !isLegatoActive, let target = activeMIDITarget else { return }
         midi.sustain(down, target: target)
     }
@@ -723,10 +734,15 @@ final class AppModel: ObservableObject {
                     wait = min(12, max(1.5, note.naturalDuration))
                 }
             }
+            let start = Date()
             self.playNotes(prepared, midiNotes: [60], target: target, duration: 1.4, hold: holdForTest, generation: generation)
             // Interruptible: this queue is serial, so a plain sleep here would hold back a
             // Play pressed during the test tone until the sleep ended.
-            self.sleepInterruptibly(wait, generation: generation)
+            self.sleepInterruptibly(
+                until: start.addingTimeInterval(wait),
+                orPedalUpAfter: start.addingTimeInterval(1.5),
+                generation: generation
+            )
             self.finishIfCurrent(generation)
         }
     }
@@ -778,8 +794,10 @@ final class AppModel: ObservableObject {
                 )
                 updateCurrentNotes(plan.names, generation: generation)
                 let ring = notes.map(\.naturalDuration).max() ?? 0
-                let interval = hold ? min(12, max(noteLength, ring)) : duration + 0.12
-                sleepInterruptibly(interval, generation: generation)
+                let start = Date()
+                let cutEnd = start.addingTimeInterval(duration + 0.12)
+                let end = hold ? start.addingTimeInterval(min(12, max(noteLength, ring))) : cutEnd
+                sleepInterruptibly(until: end, orPedalUpAfter: cutEnd, generation: generation)
             } else {
                 // Each note starts at a fixed offset from the cycle start, so the time spent
                 // starting one note never pushes the following notes later.
@@ -809,14 +827,16 @@ final class AppModel: ObservableObject {
                 // note finish: it may ring longer than a step, and the MIDI note-off must be sent
                 // before the final all-notes-off sweep cuts it.
                 var end = slot.addingTimeInterval(0.1)
+                var cutEnd = end
                 if !loop {
                     let lastStart = slot.addingTimeInterval(-stepInterval)
                     end = max(end, lastStart.addingTimeInterval(noteLength + 0.1))
+                    cutEnd = end
                     if lastHold {
                         end = max(end, lastStart.addingTimeInterval(min(12, max(1.0, lastNaturalDuration)) + 0.1))
                     }
                 }
-                sleepInterruptibly(until: end, generation: generation)
+                sleepInterruptibly(until: end, orPedalUpAfter: cutEnd, generation: generation)
             }
         } while loop && isCurrent(generation)
 
@@ -1039,6 +1059,18 @@ final class AppModel: ObservableObject {
 
     private func sleepInterruptibly(_ seconds: Double, generation: UInt64) {
         sleepInterruptibly(until: Date().addingTimeInterval(seconds), generation: generation)
+    }
+
+    /// Like `sleepInterruptibly(until:generation:)`, but past `earliest` it also ends as soon as
+    /// the pedal is up, since held notes stop ringing then.
+    private func sleepInterruptibly(until deadline: Date, orPedalUpAfter earliest: Date, generation: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        while playbackGeneration == generation {
+            let now = Date()
+            if now >= deadline || (now >= earliest && !pedalDownForPlayback) { return }
+            stateLock.wait(until: pedalDownForPlayback ? deadline : min(deadline, earliest))
+        }
     }
 
     /// Waits until `deadline` or until a newer playback replaces `generation`, whichever is first.
